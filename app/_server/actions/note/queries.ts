@@ -1,23 +1,39 @@
-"use server";
-
+import { newestFirst } from "@/app/_utils/order-utils";
 import path from "path";
 import fs from "fs/promises";
 import { Note, User, GetNotesOptions } from "@/app/_types";
-import { NOTES_DIR } from "@/app/_consts/files";
-import { Modes } from "@/app/_types/enums";
-import { getCurrentUser, getUserByNote } from "@/app/_server/actions/users";
-import { getUserModeDir, ensureDir } from "@/app/_server/actions/file";
+import { NOTES_DIR, USERS_FILE } from "@/app/_consts/files";
+import { UNCATEGORIZED } from "@/app/_consts/notes";
+import { Modes, PermissionTypes } from "@/app/_types/enums";
+import { getCurrentUser } from "@/app/_server/actions/users";
+import { getUserModeDir, ensureDir, serverReadExisting } from "@/app/_server/actions/file";
+import { uuidOf } from "@/app/_server/actions/lib/read-only";
+import { lockOf } from "@/app/_server/actions/lib/unstamped";
 import { readJsonFile } from "@/app/_server/actions/file";
-import { USERS_FILE } from "@/app/_consts/files";
 import { parseNoteContent } from "@/app/_utils/client-parser-utils";
 import {
-  generateUuid,
+  createdAtOf,
+  extractYamlMetadata,
   toIso,
-  updateYamlMetadata,
 } from "@/app/_utils/yaml-metadata-utils";
-import { readNotesRecursively } from "./readers";
+import {
+  patchNoteListing,
+  readNotesRecursively,
+  verifyNoteSummaries,
+  type ListedNote,
+  type NoteReadOptions,
+} from "./readers";
+import { mountsFor, mountedItems } from "@/app/_server/actions/share/mounts";
+import { canReachFile } from "@/app/_server/actions/share/access";
 import { isDebugFlag } from "@/app/_utils/env-utils";
-import { getOrCompute, metaCacheKey } from "@/app/_server/lib/metadata-cache";
+import {
+  getOrCompute,
+  metaCacheKey,
+  summaryCacheKey,
+} from "@/app/_server/actions/lib/metadata-cache";
+import { unlistedNote, withBody } from "./bodies";
+import { dropClashes } from "@/app/_server/actions/lib/uuid-keeper";
+import { pinsFirst } from "@/app/_utils/pin-utils";
 
 export const getAllNotes = async (allowArchived?: boolean) => {
   try {
@@ -29,13 +45,7 @@ export const getAllNotes = async (allowArchived?: boolean) => {
       const userDir = NOTES_DIR(user.username);
 
       try {
-        const userDocs = await readNotesRecursively(
-          userDir,
-          "",
-          user.username,
-          allowArchived,
-          false,
-        );
+        const userDocs = await readNotesRecursively(userDir, user.username, { allowArchived });
         allDocs.push(...userDocs);
       } catch (error) {
         continue;
@@ -50,100 +60,61 @@ export const getAllNotes = async (allowArchived?: boolean) => {
 };
 
 export const getNoteById = async (
-  id: string,
-  category?: string,
+  uuid: string,
   username?: string,
 ): Promise<Note | undefined> => {
   const { grepFindFileByUuid } = await import("@/app/_utils/grep-utils");
-  const { serverReadFile } = await import("@/app/_server/actions/file");
 
   if (!username) {
     const { getUserByNoteUuid } = await import("@/app/_server/actions/users");
-    const userByUuid = await getUserByNoteUuid(id);
+    const userByUuid = await getUserByNoteUuid(uuid);
 
-    if (userByUuid.success && userByUuid.data) {
-      username = userByUuid.data.username;
-    } else {
-      const user = await getUserByNote(id, category || "Uncategorized");
-
-      if (user.success && user.data) {
-        username = user.data.username;
-      } else {
-        return undefined;
-      }
+    if (!userByUuid.success || !userByUuid.data) {
+      return undefined;
     }
+
+    username = userByUuid.data.username;
   }
 
   let ownerUsername = username;
-  const userDir = NOTES_DIR(username);
-  const absUserDir = path.join(process.cwd(), userDir);
+  const absUserDir = path.join(process.cwd(), NOTES_DIR(username));
   let filePath: string | null = null;
-  let noteId = id;
-  let noteCategory = category || "Uncategorized";
-  const isUuid =
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+  let noteId = uuid;
+  let noteCategory = UNCATEGORIZED;
 
-  if (isUuid) {
-    const found = await grepFindFileByUuid(absUserDir, id);
-    if (found) {
-      filePath = found.filePath;
-      noteId = found.id;
-      noteCategory = found.category;
-    }
-  }
-
-  if (!filePath && category) {
-    const directPath = path.join(absUserDir, category, `${id}.md`);
-    try {
-      await fs.access(directPath);
-      filePath = directPath;
-    } catch {
-      const archivedPath = path.join(
-        absUserDir,
-        ".archive",
-        category,
-        `${id}.md`,
-      );
-      try {
-        await fs.access(archivedPath);
-        filePath = archivedPath;
-        noteCategory = `.archive/${category}`;
-      } catch {}
-    }
+  const found = await grepFindFileByUuid(absUserDir, uuid);
+  if (found) {
+    filePath = found.filePath;
+    noteId = found.id;
+    noteCategory = found.category || UNCATEGORIZED;
   }
 
   let isShared = false;
 
   if (!filePath) {
-    const { getAllSharedItemsForUser } =
-      await import("@/app/_server/actions/sharing");
-    const sharedData = await getAllSharedItemsForUser(username);
-    for (const sharedItem of sharedData.notes) {
-      const itemIdentifier = sharedItem.uuid || sharedItem.id;
-      if (!itemIdentifier) continue;
+    const mounts = await mountsFor(Modes.NOTES, username);
 
-      const sharerDir = path.join(process.cwd(), NOTES_DIR(sharedItem.sharer));
-      const found = isUuid && (await grepFindFileByUuid(sharerDir, id));
+    for (const mount of mounts) {
+      const ownerDir = path.join(process.cwd(), NOTES_DIR(mount.owner));
+      const sharedFound = await grepFindFileByUuid(ownerDir, uuid);
 
-      if (found) {
-        filePath = found.filePath;
-        noteId = found.id;
-        noteCategory = found.category;
-        isShared = true;
-        ownerUsername = sharedItem.sharer;
-        break;
-      }
+      if (!sharedFound) continue;
 
-      if (!isUuid && category) {
-        const sharedPath = path.join(sharerDir, category, `${id}.md`);
-        try {
-          await fs.access(sharedPath);
-          filePath = sharedPath;
-          isShared = true;
-          ownerUsername = sharedItem.sharer;
-          break;
-        } catch {}
-      }
+      const allowed = await canReachFile(
+        Modes.NOTES,
+        sharedFound.filePath,
+        username,
+        PermissionTypes.READ,
+      );
+
+      if (!allowed) continue;
+
+      filePath = sharedFound.filePath;
+      noteId = sharedFound.id;
+      noteCategory = sharedFound.category || UNCATEGORIZED;
+      isShared = true;
+      ownerUsername = mount.owner;
+      break;
     }
   }
 
@@ -151,40 +122,46 @@ export const getNoteById = async (
     return undefined;
   }
 
-  const rawContent = await serverReadFile(filePath);
-  if (!rawContent) return undefined;
+  const rawContent = await serverReadExisting(filePath);
+  if (rawContent === null) return undefined;
+  const lockReason = await lockOf(filePath).catch(() => null);
 
   const stats = await fs.stat(filePath);
   const parsedData = parseNoteContent(rawContent, noteId);
 
-  let finalUuid = parsedData.uuid;
-  if (!finalUuid) {
-    finalUuid = generateUuid();
-    try {
-      const updatedContent = updateYamlMetadata(rawContent, {
-        uuid: finalUuid,
-        title: parsedData.title || noteId.replace(/-/g, " "),
-      });
-      await fs.writeFile(filePath, updatedContent, "utf-8");
-    } catch (error) {
-      console.warn("Failed to save UUID to note file:", error);
-    }
-  }
-
   return {
     id: noteId,
-    uuid: finalUuid,
+    uuid: uuidOf(parsedData.uuid) || uuid,
+    ...(lockReason && { lockReason }),
     title: parsedData.title,
     content: parsedData.content,
     category: noteCategory,
-    createdAt: toIso(stats.birthtime),
+    createdAt: createdAtOf(extractYamlMetadata(rawContent).metadata, stats.birthtime),
     updatedAt: toIso(stats.mtime),
     owner: ownerUsername,
     isShared,
     encrypted: parsedData.encrypted || false,
     encryptionMethod: parsedData.encryptionMethod,
     tags: parsedData.tags || [],
+    ...(parsedData.sharedWith !== undefined && {
+      sharedWith: parsedData.sharedWith,
+    }),
+    ...(parsedData.extraMetadata && {
+      extraMetadata: parsedData.extraMetadata,
+    }),
   };
+};
+
+const _withBodies = async (
+  notes: ListedNote[],
+  bodiesFor?: (notes: Note[]) => string[],
+  keepSources = false,
+): Promise<Note[]> => {
+  const wanted = new Set(bodiesFor ? bodiesFor(notes) : []);
+  const filled = await Promise.all(
+    notes.map((note) => (wanted.has(note.uuid) ? withBody(note) : note)),
+  );
+  return keepSources ? filled : filled.map(unlistedNote);
 };
 
 export const getUserNotes = async (options: GetNotesOptions = {}) => {
@@ -200,6 +177,10 @@ export const getUserNotes = async (options: GetNotesOptions = {}) => {
     offset,
     pinnedPaths,
     preserveOrder = false,
+    summarize = false,
+    bodiesFor,
+    keepSources = false,
+    verify = false,
   } = options;
 
   try {
@@ -225,35 +206,41 @@ export const getUserNotes = async (options: GetNotesOptions = {}) => {
     const layoutTiming = metadataOnly;
     const t1 = layoutTiming ? performance.now() : 0;
 
-    const canCache = metadataOnly && !allowArchived && !isRaw && !excerptLength;
+    const isSummary = summarize && !metadataOnly && !isRaw && !excerptLength;
+    const canCache = (metadataOnly || isSummary) && !allowArchived && !isRaw && !excerptLength;
+    const cacheKeyOf = isSummary ? summaryCacheKey : metaCacheKey;
 
-    const ownCacheKey = canCache ? metaCacheKey("notes", resolvedDir) : null;
+    const ownCacheKey = canCache
+      ? cacheKeyOf(Modes.NOTES, resolvedDir)
+      : null;
 
-    const notes: Note[] = ownCacheKey
-      ? await getOrCompute(ownCacheKey, resolvedDir, () =>
-          readNotesRecursively(
-            resolvedDir,
-            "",
-            currentUser.username,
-            allowArchived,
-            isRaw,
-            metadataOnly,
-            excerptLength,
-            undefined,
-            undefined,
-          ),
-        )
-      : await readNotesRecursively(
+    const readOptions: NoteReadOptions = {
+      allowArchived,
+      isRaw,
+      metadataOnly,
+      excerptLength,
+      summarize: isSummary,
+    };
+    const readOwn = () => readNotesRecursively(resolvedDir, currentUser.username, readOptions);
+
+    const verified = new Set<string>();
+    const checked = async (key: string, dir: string) => {
+      if (!verify || !isSummary || verified.has(key)) return;
+      verified.add(key);
+      await verifyNoteSummaries(key, dir);
+    };
+
+    if (ownCacheKey) await checked(ownCacheKey, resolvedDir);
+    const cached: ListedNote[] = ownCacheKey
+      ? await getOrCompute(
+          ownCacheKey,
           resolvedDir,
-          "",
-          currentUser.username,
-          allowArchived,
-          isRaw,
-          metadataOnly,
-          excerptLength,
-          undefined,
-          undefined,
-        );
+          readOwn,
+          patchNoteListing(resolvedDir, currentUser.username, readOptions),
+        )
+      : await readOwn();
+
+    const notes: ListedNote[] = dropClashes(cached, resolvedDir);
 
     if (layoutTiming && isDebugFlag("crud")) {
       console.warn(
@@ -262,76 +249,58 @@ export const getUserNotes = async (options: GetNotesOptions = {}) => {
     }
 
     const t2 = layoutTiming ? performance.now() : 0;
-    const { getAllSharedItemsForUser } =
-      await import("@/app/_server/actions/sharing");
-    const sharedData = await getAllSharedItemsForUser(currentUser.username);
+    const mounts = await mountsFor(Modes.NOTES, currentUser.username);
     if (layoutTiming && isDebugFlag("crud")) {
       console.warn(
-        `[layout notes] sharedItems: ${(performance.now() - t2).toFixed(0)}ms`,
+        `[layout notes] mounts: ${(performance.now() - t2).toFixed(0)}ms`,
       );
     }
 
-    for (const sharedItem of sharedData.notes) {
+    for (const mount of mounts) {
       try {
-        const itemIdentifier = sharedItem.uuid || sharedItem.id;
-        if (!itemIdentifier) continue;
+        const ownerDir = NOTES_DIR(mount.owner);
+        await ensureDir(ownerDir);
 
-        const sharerDir = NOTES_DIR(sharedItem.sharer);
-        await ensureDir(sharerDir);
-
-        const sharerAbsDir = path.isAbsolute(sharerDir)
-          ? sharerDir
-          : path.join(process.cwd(), sharerDir);
-        const sharerCacheKey = canCache
-          ? metaCacheKey("notes", sharerAbsDir)
+        const ownerAbsDir = path.isAbsolute(ownerDir)
+          ? ownerDir
+          : path.join(process.cwd(), ownerDir);
+        const ownerCacheKey = canCache
+          ? cacheKeyOf(Modes.NOTES, ownerAbsDir)
           : null;
 
-        const sharerNotes = sharerCacheKey
-          ? await getOrCompute(sharerCacheKey, sharerAbsDir, () =>
-              readNotesRecursively(
-                sharerDir,
-                "",
-                sharedItem.sharer,
-                allowArchived,
-                isRaw,
-                metadataOnly,
-                excerptLength,
-              ),
+        const readOwner = () => readNotesRecursively(ownerDir, mount.owner, readOptions);
+        if (ownerCacheKey) await checked(ownerCacheKey, ownerAbsDir);
+        const ownerNotes = ownerCacheKey
+          ? await getOrCompute(
+              ownerCacheKey,
+              ownerAbsDir,
+              readOwner,
+              patchNoteListing(ownerAbsDir, mount.owner, readOptions),
             )
-          : await readNotesRecursively(
-              sharerDir,
-              "",
-              sharedItem.sharer,
-              allowArchived,
-              isRaw,
-              metadataOnly,
-              excerptLength,
-            );
+          : await readOwner();
 
-        const sharedNote = sharerNotes.find(
-          (note) => note.uuid === itemIdentifier || note.id === itemIdentifier,
+        const shared = await mountedItems(
+          Modes.NOTES,
+          currentUser.username,
+          mount,
+          ownerNotes,
         );
 
-        if (sharedNote) {
-          notes.push({
-            ...sharedNote,
-            isShared: true,
-          });
-        }
+        notes.push(...shared);
       } catch (error) {
         console.error(
-          `Error reading shared note ${sharedItem.uuid || sharedItem.id}:`,
+          `Error reading shared notes from ${mount.owner}:`,
           error,
         );
         continue;
       }
     }
 
-    let filteredNotes = notes;
+    let filteredNotes: Note[] = notes;
     if (filter) {
       if (filter.type === "category") {
         filteredNotes = notes.filter((note: any) => {
-          const noteCategory = note.category || "Uncategorized";
+          const noteCategory = note.category || UNCATEGORIZED;
           return (
             noteCategory === filter.value ||
             noteCategory.startsWith(filter.value + "/")
@@ -349,10 +318,7 @@ export const getUserNotes = async (options: GetNotesOptions = {}) => {
     }
 
     if (!preserveOrder) {
-      filteredNotes.sort(
-        (a: any, b: any) =>
-          new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
-      );
+      filteredNotes.sort(newestFirst);
     }
 
     const offsetNum = typeof offset === "number" && offset >= 0 ? offset : 0;
@@ -363,31 +329,15 @@ export const getUserNotes = async (options: GetNotesOptions = {}) => {
       limit &&
       limit > 0
     ) {
-      const pathMatches = (
-        note: { category?: string; uuid?: string; id: string },
-        p: string,
-      ) => {
-        const c = note.category || "Uncategorized";
-        const u = note.uuid || note.id;
-        return `${c}/${u}` === p || `${c}/${note.id}` === p;
-      };
-      const pinned: typeof filteredNotes = [];
-      for (const p of pinnedPaths) {
-        const found = filteredNotes.find(
-          (n: { category?: string; uuid?: string; id: string }) =>
-            pathMatches(n, p),
-        );
-        if (found) pinned.push(found);
-      }
-      const rest = filteredNotes.filter(
-        (n: { category?: string; uuid?: string; id: string }) =>
-          !pinnedPaths.some((p) => pathMatches(n, p)),
-      );
-      filteredNotes = [...pinned, ...rest].slice(0, limit);
+      filteredNotes = pinsFirst(filteredNotes, pinnedPaths, limit);
     } else if (limit && limit > 0) {
       filteredNotes = filteredNotes.slice(offsetNum, offsetNum + limit);
     } else if (offsetNum > 0) {
       filteredNotes = filteredNotes.slice(offsetNum);
+    }
+
+    if (isSummary) {
+      filteredNotes = await _withBodies(filteredNotes, bodiesFor, keepSources);
     }
 
     if (projection && projection.length > 0) {
@@ -408,16 +358,4 @@ export const getUserNotes = async (options: GetNotesOptions = {}) => {
     console.error("Error in getNotesUnified:", error);
     return { success: false, error: "Failed to fetch notes" };
   }
-};
-
-export const getNotesForDisplay = async (
-  filter?: { type: "category" | "tag"; value: string } | null,
-  limit: number = 20,
-  offset: number = 0,
-) => {
-  return getUserNotes({
-    filter: filter || undefined,
-    limit,
-    offset: filter ? offset : undefined,
-  });
 };

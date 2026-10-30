@@ -14,6 +14,7 @@ import { XChaChaEncryptionModal } from "@/app/_components/GlobalComponents/Modal
 import { detectEncryptionMethod } from "@/app/_utils/encryption-utils";
 import { useTranslations } from "next-intl";
 import { PublicUser } from "@/app/_utils/user-sanitize-utils";
+import { NOTE_PROSE_CLASS } from "@/app/_consts/notes";
 
 interface PublicNoteViewProps {
   note: Note;
@@ -82,9 +83,15 @@ export const PublicNoteView = ({ note, user }: PublicNoteViewProps) => {
                   <LockKeyIcon className="h-8 w-8 text-primary" />
                 </div>
               </div>
-              <h3 className="text-xl font-semibold">{t("encryption.thisNoteIsEncrypted")}</h3>
+              <h3 className="text-xl font-semibold">
+                {t("encryption.thisNoteIsEncrypted")}
+              </h3>
               <p className="text-md lg:text-sm text-muted-foreground">
-                This note is protected with {detectEncryptionMethod(note.content) === "pgp" ? "PGP" : "XChaCha20-Poly1305"} encryption.
+                This note is protected with{" "}
+                {detectEncryptionMethod(note.content) === "pgp"
+                  ? "PGP"
+                  : "XChaCha20-Poly1305"}{" "}
+                encryption.
               </p>
               <div className="flex items-center justify-center gap-3 pt-4">
                 <Button
@@ -92,46 +99,50 @@ export const PublicNoteView = ({ note, user }: PublicNoteViewProps) => {
                   onClick={() => setShowEncryptionModal(true)}
                   className="flex items-center gap-2"
                 >
-                  <ViewIcon className="h-4 w-4" />{t('settings.view')}</Button>
+                  <ViewIcon className="h-4 w-4" />
+                  {t("settings.view")}
+                </Button>
               </div>
             </div>
           ) : (
             <UnifiedMarkdownRenderer
               content={decryptedContent || note.content}
+              className={NOTE_PROSE_CLASS}
             />
           )}
         </div>
 
-        {note.encrypted && (() => {
-          const method = detectEncryptionMethod(note.content);
-          return method === "pgp" ? (
-            <PGPEncryptionModal
-              isOpen={showEncryptionModal}
-              onClose={() => setShowEncryptionModal(false)}
-              mode="view"
-              noteContent={note.content}
-              onSuccess={(content) => {
-                setDecryptedContent(content);
-                setShowEncryptionModal(false);
-              }}
-            />
-          ) : (
-            <XChaChaEncryptionModal
-              isOpen={showEncryptionModal}
-              onClose={() => setShowEncryptionModal(false)}
-              mode="view"
-              noteContent={note.content}
-              onSuccess={(content) => {
-                setDecryptedContent(content);
-                setShowEncryptionModal(false);
-              }}
-            />
-          );
-        })()}
+        {note.encrypted &&
+          (() => {
+            const method = detectEncryptionMethod(note.content);
+            return method === "pgp" ? (
+              <PGPEncryptionModal
+                isOpen={showEncryptionModal}
+                onClose={() => setShowEncryptionModal(false)}
+                mode="view"
+                noteContent={note.content}
+                onSuccess={(content) => {
+                  setDecryptedContent(content);
+                  setShowEncryptionModal(false);
+                }}
+              />
+            ) : (
+              <XChaChaEncryptionModal
+                isOpen={showEncryptionModal}
+                onClose={() => setShowEncryptionModal(false)}
+                mode="view"
+                noteContent={note.content}
+                onSuccess={(content) => {
+                  setDecryptedContent(content);
+                  setShowEncryptionModal(false);
+                }}
+              />
+            );
+          })()}
 
         <div className="mt-12 pt-8 border-t border-border text-center no-print">
           <p className="text-md lg:text-sm text-muted-foreground">
-            This note is shared publicly by {note.owner}
+            {t("notes.sharedPubliclyBy", { owner: note.owner ?? "" })}
           </p>
         </div>
       </div>

@@ -3,17 +3,30 @@ import createNextIntlPlugin from "next-intl/plugin";
 
 const withNextIntl = createNextIntlPlugin("./i18n.ts");
 
+const maxBodySize = "1gb";
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: "standalone",
-  serverExternalPackages: ["ws"],
-  serverActions: {
-    bodySizeLimit: "100mb",
+  serverExternalPackages: ["ws", "libsodium-wrappers-sumo", "yjs", "y-protocols", "lib0", "happy-dom"],
+  outputFileTracingIncludes: {
+    "/api/theme": ["./app/_styles/themes/colors.css"],
   },
+  experimental: {
+    // https://nextjs.org/docs/app/api-reference/config/next-config-js/serverActions
+    serverActions: {
+      bodySizeLimit: maxBodySize,
+    },
+    // https://nextjs.org/docs/app/api-reference/config/next-config-js/proxyClientMaxBodySize
+    proxyClientMaxBodySize: maxBodySize,
+  },
+  allowedDevOrigins: process.env.DEV_ORIGINS ? process.env.DEV_ORIGINS.split(',') : [],
   images: {
     unoptimized: true,
   },
   async headers() {
+    if (process.env.NODE_ENV !== "production") return [];
+
     return [
       {
         source: "/:all*(svg|jpg|jpeg|png|gif|ico|webp|avif|woff|woff2|css|js)",

@@ -2,11 +2,13 @@
 
 import { useState, useRef, useEffect, ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { MENU_CLASS } from "@/app/_consts/styling";
 
 interface ToolbarDropdownProps {
   trigger: ReactNode;
   children: ReactNode;
   direction?: "left" | "right";
+  onOpenChange?: (isOpen: boolean) => void;
 }
 
 const PORTAL_ID = "toolbar-dropdown-portal-root";
@@ -15,6 +17,7 @@ export const ToolbarDropdown = ({
   trigger,
   children,
   direction = "left",
+  onOpenChange,
 }: ToolbarDropdownProps) => {
   const [isOpen, setIsOpen] = useState(false);
   const triggerRef = useRef<HTMLDivElement>(null);
@@ -28,7 +31,9 @@ export const ToolbarDropdown = ({
       portalRoot.style.position = "fixed";
       portalRoot.style.top = "0";
       portalRoot.style.left = "0";
-      portalRoot.style.zIndex = "10";
+      // Stack above the modal portal root (z-index 9999) so dropdowns
+      // render on top of modal overlays when the editor is used inside a modal.
+      portalRoot.style.zIndex = "10000";
       portalRoot.style.pointerEvents = "none";
       document.body.appendChild(portalRoot);
     }
@@ -36,22 +41,31 @@ export const ToolbarDropdown = ({
   }, []);
 
   useEffect(() => {
+    onOpenChange?.(isOpen);
+  }, [isOpen, onOpenChange]);
+
+  useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       if (
         triggerRef.current &&
         !triggerRef.current.contains(event.target as Node) &&
-        event.target instanceof HTMLElement &&
-        event.target.nodeName !== "INPUT"
+        event.target instanceof Element &&
+        !(event.target instanceof HTMLInputElement)
       ) {
         setIsOpen(false);
       }
     };
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setIsOpen(false);
+    };
 
     if (isOpen) {
       document.addEventListener("mousedown", handleClickOutside);
+      document.addEventListener("keydown", handleEscape);
     }
     return () => {
       document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("keydown", handleEscape);
     };
   }, [isOpen]);
 
@@ -59,7 +73,7 @@ export const ToolbarDropdown = ({
     <>
       {isOpen && (
         <div
-          className="fixed bg-background border border-border rounded-jotty shadow-lg min-w-[200px] max-w-[200px] max-h-[300px] overflow-hidden flex flex-col"
+          className={`${MENU_CLASS} fixed min-w-[200px] max-w-[200px] max-h-[300px] overflow-hidden flex flex-col`}
           style={{
             top: `${
               (triggerRef.current?.getBoundingClientRect().bottom || 0) + 4

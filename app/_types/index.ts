@@ -2,6 +2,8 @@ export type { ItemType, Result, SharingPermissions } from "./core";
 
 export type {
   ChecklistType,
+  KanbanPriority,
+  KanbanReminder,
   TimeEntry,
   RecurrenceRule,
   StatusChange,
@@ -9,16 +11,25 @@ export type {
   Item,
   List,
   Checklist,
+  Comment,
+  ItemStub,
+  TickCell,
+  ListTicks,
+  MiniColumn,
+  ListSummary,
 } from "./checklist";
 
-export type { Note, NoteEditorViewModel } from "./note";
+export type { Note, NoteBody, NoteEditorViewModel, NoteSummary, TemplateSummary } from "./note";
 
 export type {
   User,
   Session,
   SanitisedUser,
+  UserSettingsPatch,
+  PublicUserInfo,
   EnableRecurrence,
   ShowCompletedSuggestions,
+  ShowChecklistEmojis,
   ImageSyntax,
   TableSyntax,
   NotesDefaultEditor,
@@ -29,13 +40,21 @@ export type {
   FileRenameMode,
   PreferredDateFormat,
   PreferredTimeFormat,
+  FirstDayOfWeek,
   Handedness,
   DisableRichEditor,
   DefaultChecklistFilter,
   DefaultNoteFilter,
   QuickCreateNotes,
   HideConnectionIndicator,
+  HideStatusOnCards,
+  HideMobileStatusDropdown,
+  HideTimeTrackingOnCards,
   CodeBlockStyle,
+  ChecklistItemClickAction,
+  NewItemInsertion,
+  NotesCardPreview,
+  NotesCompactMode,
 } from "./user";
 
 export type {
@@ -52,9 +71,21 @@ export type {
 
 export type { Category } from "./category";
 
-export type { ItemLinks, LinkIndex } from "./links";
 
 export type { TagInfo, TagsIndex } from "./tags";
+export type { AdjacentNotes, ItemShelf, LibraryStats, WikiAsk, WikiHit } from "./catalog";
+export type { BrowsePage, BrowseQuery } from "./browse";
+export type {
+  FolderStats,
+  SidebarAnchor,
+  SidebarEntry,
+  SidebarPage,
+  SidebarRow,
+  SidebarSearch,
+  SidebarSnapshot,
+  SidebarSnapshots,
+  SidebarSpot,
+} from "./sidebar";
 
 export type {
   EncryptionMethod,
@@ -82,9 +113,20 @@ export type {
 } from "./audit";
 
 export type { ExportProgress, ExportResult, ExportType } from "./export";
+export type { AttachmentFolder, AttachmentMigrationReport, AttachmentPage, FileItem } from "./attachments";
 
 export type { AppMode, ContentFilter, AppModeContextType } from "./context";
 
 export type { WsEvent } from "./websocket";
 
 export type { GetNotesOptions, GetChecklistsOptions } from "./options";
+
+export type {
+  DragPoint,
+  DragRect,
+  DragSize,
+  DropResult,
+  ListItemRect,
+} from "./dnd";
+
+export type { AppNotification, AppNotificationData, NotificationType } from "./notifications";

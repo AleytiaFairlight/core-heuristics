@@ -1,5 +1,3 @@
-"use server";
-
 import { getCurrentUser } from "@/app/_server/actions/users";
 import {
   DATA_DIR,
@@ -10,12 +8,22 @@ import {
 } from "@/app/_consts/files";
 import fs from "fs/promises";
 import path from "path";
+import { randomUUID } from "crypto";
 import { Modes } from "@/app/_types/enums";
+import { atomicWrite, withCreatedAt } from "@/app/_server/actions/file/atomic";
+import { isItemFile } from "@/app/_server/actions/relations/paths";
+import { isReadOnlyError } from "@/app/_server/actions/lib/read-only";
 
 export interface OrderData {
   categories?: string[];
   items?: string[];
 }
+
+const CORE_FILE_SEEDS: Record<string, string> = {
+  [USERS_FILE]: "[]",
+  [SESSIONS_FILE]: "{}",
+  [SESSION_DATA_FILE]: "{}",
+};
 
 export const getEnvOrFile = async (
   envVar: string,
@@ -37,17 +45,10 @@ export const ensureCorDirsAndFiles = async (): Promise<{
   success: boolean;
   error?: string;
 }> => {
-  const coreDirAndFiles = {
-    dirs: [USERS_DIR],
-    files: [USERS_FILE, SESSIONS_FILE, SESSION_DATA_FILE],
-  };
-
   try {
-    for (const dir of coreDirAndFiles.dirs) {
-      await ensureDir(path.join(process.cwd(), dir));
-    }
-    for (const file of coreDirAndFiles.files) {
-      await ensureFile(path.join(process.cwd(), file));
+    await ensureDir(path.join(process.cwd(), USERS_DIR));
+    for (const [file, initial] of Object.entries(CORE_FILE_SEEDS)) {
+      await ensureFile(path.join(process.cwd(), file), initial);
     }
     return { success: true };
   } catch (error) {
@@ -56,19 +57,20 @@ export const ensureCorDirsAndFiles = async (): Promise<{
   }
 };
 
-export const ensureDir = async (dir: string) => {
+export const ensureDir = async (dir: string): Promise<boolean> => {
   try {
     await fs.access(dir);
+    return false;
   } catch {
-    await fs.mkdir(dir, { recursive: true });
+    return (await fs.mkdir(dir, { recursive: true })) !== undefined;
   }
 };
 
-export const ensureFile = async (filePath: string) => {
+export const ensureFile = async (filePath: string, initial = "") => {
   try {
     await fs.access(filePath);
   } catch {
-    await fs.writeFile(filePath, "", "utf-8");
+    await fs.writeFile(filePath, initial, "utf-8");
   }
 };
 
@@ -88,15 +90,16 @@ export const writeJsonFile = async (
   data: any,
   filePath: string,
 ): Promise<void> => {
+  const finalPath = path.join(process.cwd(), filePath);
+  const tmpPath = `${finalPath}.${randomUUID()}.tmp`;
+
   try {
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    await fs.writeFile(
-      path.join(process.cwd(), filePath),
-      JSON.stringify(data, null, 2),
-      "utf-8",
-    );
+    await fs.mkdir(path.dirname(finalPath), { recursive: true });
+    await fs.writeFile(tmpPath, JSON.stringify(data, null, 2), "utf-8");
+    await fs.rename(tmpPath, finalPath);
   } catch (error) {
     console.error("Error writing data:", error);
+    try { await fs.unlink(tmpPath); } catch {}
     throw error;
   }
 };
@@ -115,10 +118,14 @@ export const readFile = async (filePath: string): Promise<string> => {
 
 const getCwd = (): Promise<string> => Promise.resolve(process.cwd());
 
+const KNOWN_MODES = new Set<string>(Object.values(Modes));
+
 export const getUserModeDir = async (
   mode: Modes,
   username?: string,
 ): Promise<string> => {
+  if (!KNOWN_MODES.has(mode)) throw new Error(`Unknown mode: ${mode}`);
+
   const base = await getCwd();
   if (username) {
     return path.join(base, DATA_DIR, mode, username);
@@ -128,12 +135,6 @@ export const getUserModeDir = async (
   if (!user) throw new Error("Not authenticated");
   return path.join(base, DATA_DIR, mode, user.username || "");
 };
-
-/**
- * @todo figure this out eventually, but for now it's too messy and I want this pull request to go through
- * Basically from client compoennt process.cwd is not available so I have added it to the previou functions.
- * From this comment on it's passed in via filePath/dirPath as these are ONLY called from server components.
- */
 
 export const serverReadFile = async (
   filePath: string,
@@ -146,15 +147,45 @@ export const serverReadFile = async (
   }
 };
 
+export const serverReadExisting = async (filePath: string): Promise<string | null> => {
+  try {
+    return await fs.readFile(filePath, "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
+      console.error("Could not read item file:", filePath, error);
+    }
+    return null;
+  }
+};
+
+const _tracking = () => import("@/app/_server/actions/relations/tracking");
+
 export const serverWriteFile = async (filePath: string, content: string) => {
   await ensureDir(path.dirname(filePath));
-  await fs.writeFile(filePath, content, "utf-8");
+
+  if (!isItemFile(filePath)) {
+    await atomicWrite(filePath, content);
+    return;
+  }
+
+  const stamped = await withCreatedAt(filePath, content);
+  await atomicWrite(filePath, stamped);
+  await (await _tracking()).trackItemWrite(filePath, stamped);
+};
+
+export const serverRenamePath = async (from: string, to: string) => {
+  await ensureDir(path.dirname(to));
+  await fs.rename(from, to);
+  await (await _tracking()).trackMove(from, to);
 };
 
 export const serverDeleteFile = async (filePath: string) => {
   try {
     await fs.unlink(filePath);
+    await (await _tracking()).trackItemDelete(filePath);
   } catch (error) {
+    if (isReadOnlyError(error)) throw error;
+
     const { logAudit } = await import("@/app/_server/actions/log");
     await logAudit({
       level: "DEBUG",
@@ -200,7 +231,10 @@ export const listMdFilesUnderPath = async (
 export const serverDeleteDir = async (dirPath: string) => {
   try {
     await fs.rm(dirPath, { recursive: true });
+    await (await _tracking()).trackTreeDelete(dirPath);
   } catch (error) {
+    if (isReadOnlyError(error)) throw error;
+
     const { logAudit } = await import("@/app/_server/actions/log");
     await logAudit({
       level: "DEBUG",
@@ -215,40 +249,16 @@ export const serverDeleteDir = async (dirPath: string) => {
 export const readOrderFile = async (
   dirPath: string,
 ): Promise<OrderData | null> => {
-  try {
-    const filePath = path.join(dirPath, ".order.json");
-    const content = await fs.readFile(filePath, "utf-8");
-    const data = JSON.parse(content) as OrderData;
-    const categories = Array.isArray(data.categories)
-      ? data.categories
-      : undefined;
-    const items = Array.isArray(data.items) ? data.items : undefined;
-    return { categories, items };
-  } catch {
-    return null;
-  }
+  const { readCatOrder } = await import("@/app/_server/actions/share/category-info");
+  return readCatOrder(dirPath);
 };
 
 export const writeOrderFile = async (
   dirPath: string,
   data: OrderData,
 ): Promise<{ success: boolean }> => {
-  try {
-    await fs.mkdir(dirPath, { recursive: true });
-    const filePath = path.join(dirPath, ".order.json");
-    const toWrite: OrderData = {};
-    if (data.categories && data.categories.length > 0) {
-      toWrite.categories = data.categories;
-    }
-    if (data.items && data.items.length > 0) {
-      toWrite.items = data.items;
-    }
-
-    await fs.writeFile(filePath, JSON.stringify(toWrite, null, 2), "utf-8");
-    return { success: true };
-  } catch {
-    return { success: false };
-  }
+  const { writeCatOrder } = await import("@/app/_server/actions/share/category-info");
+  return { success: await writeCatOrder(dirPath, data) };
 };
 
 const STAT_BATCH_SIZE = 4000;
@@ -256,6 +266,8 @@ const STAT_BATCH_SIZE = 4000;
 export interface FileStatsEntry {
   birthtime: Date;
   mtime: Date;
+  size?: number;
+  ctime?: Date;
 }
 
 export const getAllFileStats = async (
@@ -298,7 +310,7 @@ export const getAllFileStats = async (
                 s.birthtime.getTime() === 0 ? s.mtime : s.birthtime;
               return {
                 filePath,
-                entry: { birthtime, mtime: s.mtime },
+                entry: { birthtime, mtime: s.mtime, size: s.size, ctime: s.ctime },
               };
             } catch {
               return null;

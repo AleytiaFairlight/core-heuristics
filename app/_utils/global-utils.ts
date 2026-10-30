@@ -1,5 +1,7 @@
 import { type ClassValue, clsx } from "clsx";
 import { twMerge } from "tailwind-merge";
+import { ItemType } from "@/app/_types/core";
+import { ItemTypes } from "@/app/_types/enums";
 export const cn = (...inputs: ClassValue[]) => {
   return twMerge(clsx(inputs));
 };
@@ -74,35 +76,31 @@ export function encodeCategoryPath(categoryPath: string): string {
     .join("/");
 }
 
+export const decodeSegment = (segment: string): string => {
+  try {
+    return decodeURIComponent(segment);
+  } catch (error) {
+    console.warn("Malformed URL segment, using it verbatim:", segment, error);
+    return segment;
+  }
+};
+
 export function decodeCategoryPath(encodedPath: string): string {
   if (!encodedPath) {
     return "Uncategorized";
   }
 
-  return encodedPath
-    .split("/")
-    .map((segment) => decodeURIComponent(segment))
-    .join("/");
+  return encodedPath.split("/").map(decodeSegment).join("/");
 }
 
-export function buildCategoryPath(category: string, id: string): string {
-  const encodedCategory = encodeCategoryPath(category);
-  return encodedCategory ? `${encodedCategory}/${encodeId(id)}` : encodeId(id);
-}
+export const itemHref = (type: ItemType, uuid: string): string =>
+  type === ItemTypes.CHECKLIST ? `/checklist/${uuid}` : `/note/${uuid}`;
 
-export function decodeId(encodedId: string): string {
-  if (!encodedId) {
-    return encodedId;
-  }
-  return decodeURIComponent(encodedId);
-}
+export const publicHref = (type: ItemType, uuid: string): string =>
+  `/public${itemHref(type, uuid)}`;
 
-export function encodeId(id: string): string {
-  if (id.includes("%20") || id.includes("%2F")) {
-    return id;
-  }
-  return encodeURIComponent(id);
-}
+export const isPinnedEntry = (entry: string, uuid?: string): boolean =>
+  Boolean(uuid) && (entry === uuid || entry.split("/").pop() === uuid);
 
 export const generateWebManifest = (
   appName: string,
@@ -170,6 +168,11 @@ export const getFormData = (formData: FormData, keys: string[]) => {
   return data;
 };
 
+const CONTAINED_SCROLLER = '[role="dialog"], .overscroll-contain';
+
+export const isPageScroller = (target: HTMLElement, targetClass: string): boolean =>
+  Boolean(target.classList?.contains(targetClass)) && !target.closest?.(CONTAINED_SCROLLER);
+
 export const handleScroll = (
   e: Event,
   targetClass: string,
@@ -178,7 +181,7 @@ export const handleScroll = (
 ) => {
   const target = e.target as HTMLElement;
 
-  if (!target.classList?.contains(targetClass)) return;
+  if (!isPageScroller(target, targetClass)) return;
 
   if (window.innerWidth >= 1024) {
     setIsVisible(true);
@@ -198,3 +201,6 @@ export const handleScroll = (
 
   lastScrollY.current = currentScrollY;
 };
+
+export const rangeFill = (value: number, min: number, max: number): string =>
+  `${max === min ? 0 : ((value - min) / (max - min)) * 100}%`;

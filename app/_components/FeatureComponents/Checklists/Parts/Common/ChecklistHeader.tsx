@@ -7,26 +7,28 @@ import {
   Share08Icon,
   TaskDaily01Icon,
   CheckmarkSquare04Icon,
-  UserMultipleIcon,
-  Globe02Icon,
   GridIcon,
   Tick02Icon,
   MoreHorizontalIcon,
   Archive02Icon,
   Copy01Icon,
   Copy02Icon,
+  SourceCodeIcon,
 } from "hugeicons-react";
+import { BrainButton } from "@/app/_components/FeatureComponents/Brain/Parts/BrainButton";
 import { Button } from "@/app/_components/GlobalComponents/Buttons/Button";
 import { Checklist } from "@/app/_types";
 import { useChecklist } from "../../../../../_hooks/useChecklist";
 import { DropdownMenu } from "@/app/_components/GlobalComponents/Dropdowns/DropdownMenu";
-import { encodeCategoryPath } from "@/app/_utils/global-utils";
 import { useAppMode } from "@/app/_providers/AppModeProvider";
-import { sharingInfo } from "@/app/_utils/sharing-utils";
-import { ChecklistsTypes } from "@/app/_types/enums";
+import { shareGrants, sharingInfo } from "@/app/_utils/sharing-utils";
+import { ShareBadges } from "@/app/_components/GlobalComponents/Indicators/ShareBadges";
+import { SharedFromBadge } from "@/app/_components/GlobalComponents/Indicators/SharedFromBadge";
+import { ChecklistsTypes, ItemTypes, Modes } from "@/app/_types/enums";
 import { usePermissions } from "@/app/_providers/PermissionsProvider";
 import { useState } from "react";
 import { SharedWithModal } from "@/app/_components/GlobalComponents/Modals/SharingModals/SharedWithModal";
+import { FrontmatterModal } from "@/app/_components/GlobalComponents/Modals/FrontmatterModal";
 import { useMetadata } from "@/app/_providers/MetadataProvider";
 import { useTranslations } from "next-intl";
 
@@ -61,12 +63,12 @@ export const ChecklistHeader = ({
   const { globalSharing } = useAppMode();
   const { permissions } = usePermissions();
   const [showSharedWithModal, setShowSharedWithModal] = useState(false);
+  const [showFrontmatterModal, setShowFrontmatterModal] = useState(false);
 
-  const encodedCategory = encodeCategoryPath(metadata.category);
-  const itemDetails = sharingInfo(globalSharing, metadata.uuid || metadata.id, encodedCategory);
+  const itemDetails = sharingInfo(globalSharing, metadata.uuid || "");
   const isShared = itemDetails.exists && itemDetails.sharedWith.length > 0;
 
-  const sharedWith = itemDetails.sharedWith;
+  const grants = shareGrants(globalSharing, metadata.uuid || "", Modes.CHECKLISTS);
   const isPubliclyShared = itemDetails.isPublic;
 
   return (
@@ -91,7 +93,7 @@ export const ChecklistHeader = ({
               size="sm"
               onClick={handleCopyId}
               className="h-6 w-6 p-0"
-              title={`Copy ID: ${checklist?.uuid || checklist?.id}`}
+              title={`Copy ID: ${checklist?.uuid || ""}`}
             >
               {copied ? (
                 <Tick02Icon className="h-3 w-3 text-green-500" />
@@ -100,20 +102,16 @@ export const ChecklistHeader = ({
               )}
             </Button>
 
-            {isPubliclyShared && (
-              <span title={t('checklists.publiclyShared')}>
-                <Globe02Icon className="h-3 w-3 text-primary" />
-              </span>
-            )}
-            {isShared && (
-              <span
-                title={`Shared with ${sharedWith.join(", ")}`}
-                className="cursor-pointer hover:text-primary"
-                onClick={() => setShowSharedWithModal(true)}
-              >
-                <UserMultipleIcon className="h-3 w-3" />
-              </span>
-            )}
+            <SharedFromBadge
+              owner={checklist?.sharedFrom}
+              permissions={checklist?.permissions}
+            />
+            <ShareBadges
+              grants={grants}
+              isPublic={isPubliclyShared}
+              iconClassName="h-3 w-3"
+              onClick={isShared ? () => setShowSharedWithModal(true) : undefined}
+            />
           </div>
         </div>
 
@@ -128,12 +126,12 @@ export const ChecklistHeader = ({
                 }}
                 className="h-10 w-10 p-0"
                 title={
-                  checklist.type === ChecklistsTypes.TASK
+                  checklist.type === ChecklistsTypes.KANBAN || checklist.type === ChecklistsTypes.TASK
                     ? t('checklists.convertToSimpleChecklist')
                     : t('checklists.convertToTaskProject')
                 }
               >
-                {checklist.type === ChecklistsTypes.TASK ? (
+                {checklist.type === ChecklistsTypes.KANBAN || checklist.type === ChecklistsTypes.TASK ? (
                   <CheckmarkSquare04Icon className="h-4 w-4 lg:h-5 lg:w-5" />
                 ) : (
                   <TaskDaily01Icon className="h-4 w-4 lg:h-5 lg:w-5" />
@@ -153,11 +151,14 @@ export const ChecklistHeader = ({
             )}
           </div>
 
+          <BrainButton uuid={checklist.uuid} className="h-10 w-10" />
+
           {(permissions?.canEdit || permissions?.canDelete) && (
             <div
               className={`${permissions?.canEdit &&
                 !permissions?.canDelete &&
                 !permissions?.isOwner &&
+                permissions?.isLocked &&
                 "lg:hidden"
                 }`}
             >
@@ -169,24 +170,25 @@ export const ChecklistHeader = ({
                   </Button>
                 }
                 items={[
-                  ...(onConvertType && permissions?.canEdit
+                  { type: "heading" as const, label: t("menuGroups.organise") },
+                  ...(onEdit && permissions?.canEdit
                     ? [
                       {
                         type: "item" as const,
-                        label:
-                          checklist.type === ChecklistsTypes.TASK
-                            ? "Convert to Simple Checklist"
-                            : "Convert to Task Project",
-                        icon:
-                          checklist.type === ChecklistsTypes.TASK ? (
-                            <CheckmarkSquare04Icon className="h-4 w-4" />
-                          ) : (
-                            <TaskDaily01Icon className="h-4 w-4" />
-                          ),
-                        onClick: () => {
-                          onConvertType();
-                        },
+                        label: t("editor.edit"),
+                        icon: <PencilEdit02Icon className="h-4 w-4" />,
+                        onClick: onEdit,
                         className: "lg:!hidden",
+                      },
+                    ]
+                    : []),
+                  ...(onShare && permissions?.isOwner && !permissions?.isLocked
+                    ? [
+                      {
+                        type: "item" as const,
+                        label: t("sharing.share"),
+                        icon: <Share08Icon className="h-4 w-4" />,
+                        onClick: onShare,
                       },
                     ]
                     : []),
@@ -194,7 +196,7 @@ export const ChecklistHeader = ({
                     ? [
                       {
                         type: "item" as const,
-                        label: "Clone",
+                        label: t("common.clone"),
                         icon: <Copy02Icon className="h-4 w-4" />,
                         onClick: onClone,
                       },
@@ -210,27 +212,40 @@ export const ChecklistHeader = ({
                       },
                     ]
                     : []),
-                  ...(onShare && permissions?.isOwner
+                  { type: "divider" as const },
+                  { type: "heading" as const, label: t("menuGroups.advanced") },
+                  ...(onConvertType && permissions?.canEdit
                     ? [
                       {
                         type: "item" as const,
-                        label: t("sharing.share"),
-                        icon: <Share08Icon className="h-4 w-4" />,
-                        onClick: onShare,
-                      },
-                    ]
-                    : []),
-                  ...(onEdit && permissions?.canEdit
-                    ? [
-                      {
-                        type: "item" as const,
-                        label: t("editor.edit"),
-                        icon: <PencilEdit02Icon className="h-4 w-4" />,
-                        onClick: onEdit,
+                        label:
+                          checklist.type === ChecklistsTypes.KANBAN || checklist.type === ChecklistsTypes.TASK
+                            ? t("checklists.convertToSimpleChecklist")
+                            : t("checklists.convertToKanbanBoard"),
+                        icon:
+                          checklist.type === ChecklistsTypes.KANBAN || checklist.type === ChecklistsTypes.TASK ? (
+                            <CheckmarkSquare04Icon className="h-4 w-4" />
+                          ) : (
+                            <TaskDaily01Icon className="h-4 w-4" />
+                          ),
+                        onClick: () => {
+                          onConvertType();
+                        },
                         className: "lg:!hidden",
                       },
                     ]
                     : []),
+                  ...(permissions?.canEdit && !permissions?.isLocked
+                    ? [
+                      {
+                        type: "item" as const,
+                        label: t("frontmatter.edit"),
+                        icon: <SourceCodeIcon className="h-4 w-4" />,
+                        onClick: () => setShowFrontmatterModal(true),
+                      },
+                    ]
+                    : []),
+                  { type: "divider" as const },
                   ...(onDelete && permissions?.canDelete
                     ? [
                       {
@@ -254,6 +269,14 @@ export const ChecklistHeader = ({
         isOpen={showSharedWithModal}
         onClose={() => setShowSharedWithModal(false)}
       />
+
+      {showFrontmatterModal && checklist.uuid && (
+        <FrontmatterModal
+          uuid={checklist.uuid}
+          itemType={ItemTypes.CHECKLIST}
+          onClose={() => setShowFrontmatterModal(false)}
+        />
+      )}
     </div>
   );
 };

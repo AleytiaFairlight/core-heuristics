@@ -1,8 +1,45 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
-import { isEnvEnabled, isDebugFlag } from "./app/_utils/env-utils";
+import { isDebugFlag, getSessionCookieName } from "./app/_utils/env-utils";
 
 const debugProxy = isDebugFlag("proxy");
+
+const SESSION_CACHE_TTL = 10_000;
+const sessionCache = new Map<string, { valid: boolean; ts: number }>();
+
+const _checkSession = async (sessionId: string, internalApiUrl: string, cookie: string) => {
+  const cached = sessionCache.get(sessionId);
+  if (cached && Date.now() - cached.ts < SESSION_CACHE_TTL) return cached.valid;
+
+  const sessionCheckUrl = new URL(`${internalApiUrl}/api/auth/check-session`);
+
+  if (debugProxy) {
+    console.log("MIDDLEWARE - Session Check URL:", sessionCheckUrl.href);
+  }
+
+  const res = await fetch(sessionCheckUrl, {
+    headers: { Cookie: cookie },
+    cache: "no-store",
+  });
+
+  if (debugProxy) {
+    console.log("MIDDLEWARE - Session Check Response:");
+    console.log("  status:", res.status);
+    console.log("  statusText:", res.statusText);
+    console.log("  ok:", res.ok);
+  }
+
+  sessionCache.set(sessionId, { valid: res.ok, ts: Date.now() });
+
+  if (sessionCache.size > 1000) {
+    const now = Date.now();
+    sessionCache.forEach((val, key) => {
+      if (now - val.ts > SESSION_CACHE_TTL) sessionCache.delete(key);
+    });
+  }
+
+  return res.ok;
+};
 
 export const proxy = async (request: NextRequest) => {
   const { pathname } = request.nextUrl;
@@ -22,11 +59,7 @@ export const proxy = async (request: NextRequest) => {
     return NextResponse.next();
   }
 
-  const cookieName =
-    process.env.NODE_ENV === "production" && isEnvEnabled(process.env.HTTPS)
-      ? "__Host-session"
-      : "session";
-  const sessionId = request.cookies.get(cookieName)?.value;
+  const sessionId = request.cookies.get(getSessionCookieName())?.value;
 
   if (debugProxy) {
     console.log(
@@ -61,29 +94,15 @@ export const proxy = async (request: NextRequest) => {
       console.log("  → Using:", internalApiUrl);
     }
 
-    const sessionCheckUrl = new URL(`${internalApiUrl}/api/auth/check-session`);
+    const valid = await _checkSession(
+      sessionId,
+      internalApiUrl,
+      request.headers.get("Cookie") || "",
+    );
 
-    if (debugProxy) {
-      console.log("MIDDLEWARE - Session Check URL:", sessionCheckUrl.href);
-    }
-
-    const sessionCheck = await fetch(sessionCheckUrl, {
-      headers: {
-        Cookie: request.headers.get("Cookie") || "",
-      },
-      cache: "no-store",
-    });
-
-    if (debugProxy) {
-      console.log("MIDDLEWARE - Session Check Response:");
-      console.log("  status:", sessionCheck.status);
-      console.log("  statusText:", sessionCheck.statusText);
-      console.log("  ok:", sessionCheck.ok);
-    }
-
-    if (!sessionCheck.ok) {
+    if (!valid) {
       const redirectResponse = NextResponse.redirect(loginUrl);
-      redirectResponse.cookies.delete(cookieName);
+      redirectResponse.cookies.delete(getSessionCookieName());
 
       if (debugProxy) {
         console.log("MIDDLEWARE - session is not ok");
@@ -102,6 +121,6 @@ export const proxy = async (request: NextRequest) => {
 
 export const config = {
   matcher: [
-    "/((?!_next/static|_next/image|favicon.ico|site.webmanifest|sw.js|app-icons).*)",
+    "/((?!_next/static|_next/image|favicon.ico|site.webmanifest|sw.js|app-icons|app-screenshots|flags|fonts|images|repo-images|themes).*)",
   ],
 };

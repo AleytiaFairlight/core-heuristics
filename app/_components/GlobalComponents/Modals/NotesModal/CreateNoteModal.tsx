@@ -6,17 +6,28 @@ import { createNote } from "@/app/_server/actions/note";
 import { Category, Note } from "@/app/_types";
 import { Modal } from "../Modal";
 import { CategoryInput } from "@/app/_components/GlobalComponents/FormElements/CategoryInput";
+import { TemplateInput } from "@/app/_components/GlobalComponents/FormElements/TemplateInput";
+import { useTemplateList, useTemplateMaker } from "@/app/_hooks/useTemplates";
+import { TEMPLATE_ID_FIELD } from "@/app/_consts/templates";
 import { Modes } from "@/app/_types/enums";
 import { createCategory } from "@/app/_server/actions/category";
 import { useAppMode } from "@/app/_providers/AppModeProvider";
 import { Input } from "@/app/_components/GlobalComponents/FormElements/Input";
+import { Toggle } from "@/app/_components/GlobalComponents/FormElements/Toggle";
+import { PGPEncryptionModal } from "@/app/_components/GlobalComponents/Modals/EncryptionModals/PGPEncryptionModal";
+import { XChaChaEncryptionModal } from "@/app/_components/GlobalComponents/Modals/EncryptionModals/XChaChaEncryptionModal";
 import { useTranslations } from "next-intl";
+import { useToast } from "@/app/_providers/ToastProvider";
+
+const ENCRYPTION_PLACEHOLDER_CONTENT = "Note placeholder";
 
 interface CreateNoteModalProps {
   onClose: () => void;
   onCreated: (doc?: Note) => void;
   categories: Category[];
   initialCategory?: string;
+  initialTitle?: string;
+  initialTemplate?: string;
 }
 
 export const CreateNoteModal = ({
@@ -24,51 +35,116 @@ export const CreateNoteModal = ({
   onCreated,
   categories,
   initialCategory = "",
+  initialTitle = "",
+  initialTemplate = "",
 }: CreateNoteModalProps) => {
   const t = useTranslations();
   const { user } = useAppMode();
-  const [title, setTitle] = useState("");
+  const { showToast } = useToast();
+  const [title, setTitle] = useState(initialTitle);
   const [category, setCategory] = useState(initialCategory);
   const [newCategory, setNewCategory] = useState("");
   const [isCreating, setIsCreating] = useState(false);
   const [showNewCategory, setShowNewCategory] = useState(false);
+  const [encryptOnCreate, setEncryptOnCreate] = useState(false);
+  const [showEncryptionModal, setShowEncryptionModal] = useState(false);
+  const [templateId, setTemplateId] = useState(initialTemplate);
+  const { templates } = useTemplateList();
+  const { makeBlank, isMaking } = useTemplateMaker();
+  const isBusy = isCreating || isMaking;
   const titleInputRef = useRef<HTMLInputElement>(null);
+
+  const encryptionMethod = user?.encryptionSettings?.method || "xchacha";
 
   useEffect(() => {
     titleInputRef.current?.focus();
   }, []);
 
+  const _complain = (message: string, error?: string) => {
+    console.warn("Note creation refused:", error || message);
+    showToast({
+      type: "error",
+      title: t("common.error"),
+      message: error || message,
+    });
+  };
+
+  const _resolveCategoryPath = async (): Promise<string | null> => {
+    if (showNewCategory && newCategory.trim()) {
+      const newCatTrimmed = newCategory.trim();
+      const categoryFormData = new FormData();
+      categoryFormData.append("name", newCatTrimmed);
+      categoryFormData.append("mode", Modes.NOTES);
+      if (category) {
+        categoryFormData.append("parent", category);
+      }
+      const made = await createCategory(categoryFormData);
+      if (!made.success) {
+        _complain(t("notes.createCategoryFailed"), made.error);
+        return null;
+      }
+      return category ? `${category}/${newCatTrimmed}` : newCatTrimmed;
+    }
+    return category;
+  };
+
+  const _finalizeCreate = async (rawContent: string, isEncrypted = false) => {
+    const finalCategoryPath = await _resolveCategoryPath();
+    if (finalCategoryPath === null) return;
+
+    const formData = new FormData();
+    formData.append("title", title.trim());
+    formData.append("category", finalCategoryPath);
+    formData.append("rawContent", rawContent);
+    if (templateId && !isEncrypted) formData.append(TEMPLATE_ID_FIELD, templateId);
+    const result = await createNote(formData);
+    if (!result.success) {
+      _complain(t("notes.createNoteFailed"), result.error);
+      return;
+    }
+
+    const doc = result.data && isEncrypted
+      ? { ...result.data, encrypted: true }
+      : result.data;
+    onCreated(doc);
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!title.trim()) return;
 
+    if (encryptOnCreate) {
+      setShowEncryptionModal(true);
+      return;
+    }
+
     setIsCreating(true);
     try {
-      let finalCategoryPath = category;
-      if (showNewCategory && newCategory.trim()) {
-        const newCatTrimmed = newCategory.trim();
-        const categoryFormData = new FormData();
-        categoryFormData.append("name", newCatTrimmed);
-        categoryFormData.append("mode", Modes.NOTES);
-        if (category) {
-          categoryFormData.append("parent", category);
-        }
-        await createCategory(categoryFormData);
-        finalCategoryPath = category
-          ? `${category}/${newCatTrimmed}`
-          : newCatTrimmed;
-      }
-
-      const formData = new FormData();
-      formData.append("title", title.trim());
-      formData.append("category", finalCategoryPath);
-      formData.append("content", "");
-      const result = await createNote(formData);
-
-      if (result.success) onCreated(result.data);
+      await _finalizeCreate("");
     } finally {
       setIsCreating(false);
     }
+  };
+
+  const handleEncryptionSuccess = async (encryptedContent: string) => {
+    setShowEncryptionModal(false);
+    setIsCreating(true);
+    try {
+      await _finalizeCreate(encryptedContent, true);
+    } finally {
+      setIsCreating(false);
+    }
+  };
+
+  const handleMakeBlank = async (name: string): Promise<boolean> => {
+    const made = await makeBlank(name);
+    if (made) onClose();
+    return made;
+  };
+
+  const handleEncryptToggle = (encrypt: boolean) => {
+    setEncryptOnCreate(encrypt);
+    if (encrypt) setTemplateId("");
   };
 
   const handleShowNewCategory = (show: boolean) => {
@@ -89,7 +165,7 @@ export const CreateNoteModal = ({
           onChange={(e) => setTitle(e.target.value)}
           placeholder={t('notes.enterNoteTitle')}
           required
-          disabled={isCreating}
+          disabled={isBusy}
           autoFocus
         />
 
@@ -101,25 +177,64 @@ export const CreateNoteModal = ({
           onNewCategoryChange={setNewCategory}
           showNewCategory={showNewCategory}
           onShowNewCategoryChange={handleShowNewCategory}
-          disabled={isCreating}
+          disabled={isBusy}
         />
+
+        <TemplateInput
+          templates={templates}
+          selectedTemplate={templateId}
+          onTemplateChange={setTemplateId}
+          onMakeBlank={handleMakeBlank}
+          disabled={isBusy || encryptOnCreate}
+        />
+
+        <div className="flex items-center justify-between gap-3">
+          <label htmlFor="encryptOnCreate" className="text-sm text-foreground cursor-pointer">
+            {t('encryption.encryptNote')}
+          </label>
+          <Toggle
+            id="encryptOnCreate"
+            checked={encryptOnCreate}
+            onCheckedChange={handleEncryptToggle}
+            disabled={isBusy || Boolean(templateId)}
+          />
+        </div>
 
         <div className="flex gap-3 pt-4">
           <Button
             type="button"
             variant="outline"
             onClick={onClose}
-            disabled={isCreating}
+            disabled={isBusy}
           >{t('common.cancel')}</Button>
           <Button
             type="submit"
-            disabled={!title.trim() || isCreating}
+            disabled={!title.trim() || isBusy}
             className="flex-1"
           >
             {isCreating ? t('common.creating') : t('common.create')}
           </Button>
         </div>
       </form>
+
+      {showEncryptionModal && encryptionMethod === "pgp" && (
+        <PGPEncryptionModal
+          isOpen={showEncryptionModal}
+          onClose={() => setShowEncryptionModal(false)}
+          mode="encrypt"
+          noteContent={ENCRYPTION_PLACEHOLDER_CONTENT}
+          onSuccess={handleEncryptionSuccess}
+        />
+      )}
+      {showEncryptionModal && encryptionMethod === "xchacha" && (
+        <XChaChaEncryptionModal
+          isOpen={showEncryptionModal}
+          onClose={() => setShowEncryptionModal(false)}
+          mode="encrypt"
+          noteContent={ENCRYPTION_PLACEHOLDER_CONTENT}
+          onSuccess={handleEncryptionSuccess}
+        />
+      )}
     </Modal>
   );
 };

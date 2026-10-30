@@ -1,9 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import {
-  resetAllMocks,
-  createFormData,
-  mockFs,
-} from "../setup";
+import { resetAllMocks, createFormData, mockFs } from "../setup";
 
 const mockGetUserModeDir = vi.fn();
 const mockEnsureDir = vi.fn();
@@ -14,20 +10,25 @@ const mockServerReadFile = vi.fn();
 const mockReadOrderFile = vi.fn();
 const mockGetCurrentUser = vi.fn();
 const mockGetUsername = vi.fn();
-const mockCheckUserPermission = vi.fn();
+const mockCanReach = vi.fn();
 const mockLogContentEvent = vi.fn();
-const mockParseInternalLinks = vi.fn();
-const mockUpdateIndexForItem = vi.fn();
-const mockRemoveItemFromIndex = vi.fn();
+const mockTidyItemLinks = vi.fn();
 const mockCommitNote = vi.fn();
 const mockGetSettings = vi.fn();
 const mockExtractHashtagsFromContent = vi.fn();
 const mockGenerateYamlFrontmatter = vi.fn();
 const mockExtractYamlMetadata = vi.fn();
 const mockExtractTitle = vi.fn();
+const mockStrayMeta = vi.fn();
+const mockKeptMeta = vi.fn();
 const mockGetUserByNote = vi.fn();
 const mockGetUserByNoteUuid = vi.fn();
 const mockGetNoteById = vi.fn();
+const mockTargetDir = vi.fn();
+const mockBouncer = vi.fn();
+const mockShownAs = vi.fn();
+const mockMovePlan = vi.fn();
+const mockRefusalMessage = vi.fn();
 
 vi.mock("@/app/_server/actions/note/queries", () => ({
   getNoteById: (...args: unknown[]) => mockGetNoteById(...args),
@@ -40,6 +41,7 @@ vi.mock("@/app/_server/actions/file", () => ({
   serverDeleteFile: (...args: any[]) => mockServerDeleteFile(...args),
   serverReadDir: (...args: any[]) => mockServerReadDir(...args),
   serverReadFile: (...args: any[]) => mockServerReadFile(...args),
+  serverReadExisting: async (...args: any[]) => (await mockServerReadFile(...args)) ?? null,
   readOrderFile: (...args: any[]) => mockReadOrderFile(...args),
   readJsonFile: vi.fn().mockResolvedValue([]),
 }));
@@ -49,30 +51,32 @@ vi.mock("@/app/_server/actions/users", () => ({
   getUsername: (...args: any[]) => mockGetUsername(...args),
   getUserByNote: (...args: any[]) => mockGetUserByNote(...args),
   getUserByNoteUuid: (...args: any[]) => mockGetUserByNoteUuid(...args),
-  getUserByUsername: vi.fn().mockResolvedValue(null),
+  getPublicUser: vi.fn().mockResolvedValue(null),
   isAuthenticated: vi.fn().mockResolvedValue(true),
 }));
 
-vi.mock("@/app/_server/actions/sharing", () => ({
-  checkUserPermission: (...args: any[]) => mockCheckUserPermission(...args),
-  getAllSharedItemsForUser: vi
-    .fn()
-    .mockResolvedValue({ notes: [], checklists: [] }),
-  updateSharingData: vi.fn().mockResolvedValue(undefined),
+vi.mock("@/app/_server/actions/share/queries", () => ({
+  canReach: (...args: any[]) => mockCanReach(...args),
+}));
+
+vi.mock("@/app/_server/actions/share/target", () => ({
+  targetDir: (...args: any[]) => mockTargetDir(...args),
+  bouncer: (...args: any[]) => mockBouncer(...args),
+  shownAs: (...args: any[]) => mockShownAs(...args),
+  movePlan: (...args: any[]) => mockMovePlan(...args),
+  refusalMessage: (...args: any[]) => mockRefusalMessage(...args),
 }));
 
 vi.mock("@/app/_server/actions/log", () => ({
   logContentEvent: (...args: any[]) => mockLogContentEvent(...args),
 }));
 
-vi.mock("@/app/_server/actions/link", () => ({
-  parseInternalLinks: (...args: any[]) => mockParseInternalLinks(...args),
-  updateIndexForItem: (...args: any[]) => mockUpdateIndexForItem(...args),
-  removeItemFromIndex: (...args: any[]) => mockRemoveItemFromIndex(...args),
-  rebuildLinkIndex: vi.fn().mockResolvedValue(undefined),
+vi.mock("@/app/_server/actions/relations/tidy", () => ({
+  tidyItemLinks: (...args: any[]) => mockTidyItemLinks(...args),
+  refreshWikilinks: (markdown: string) => markdown,
 }));
 
-vi.mock("@/app/_server/actions/history", () => ({
+vi.mock("@/app/_server/actions/history/repo", () => ({
   commitNote: (...args: any[]) => mockCommitNote(...args),
 }));
 
@@ -86,23 +90,35 @@ vi.mock("@/app/_utils/filename-utils", () => ({
 }));
 
 vi.mock("@/app/_utils/yaml-metadata-utils", () => ({
+  OwnedMetaKeys: { CREATED_AT: "createdAt" },
   generateUuid: vi.fn().mockReturnValue("test-uuid-123"),
-  generateYamlFrontmatter: (...args: any[]) => mockGenerateYamlFrontmatter(...args),
+  generateYamlFrontmatter: (...args: any[]) =>
+    mockGenerateYamlFrontmatter(...args),
   extractYamlMetadata: (...args: any[]) => mockExtractYamlMetadata(...args),
   updateYamlMetadata: vi
     .fn()
     .mockReturnValue("---\nuuid: test-uuid-123\n---\nTest content"),
   extractTitle: (...args: any[]) => mockExtractTitle(...args),
+  strayMeta: (...args: any[]) => mockStrayMeta(...args),
+  keptMeta: (...args: any[]) => mockKeptMeta(...args),
 }));
 
 vi.mock("@/app/_utils/markdown-utils", () => ({
   sanitizeMarkdown: vi.fn().mockImplementation((content) => content),
 }));
 
-vi.mock("@/app/_utils/tag-utils", () => ({
-  extractHashtagsFromContent: (...args: any[]) =>
-    mockExtractHashtagsFromContent(...args),
-}));
+vi.mock("@/app/_utils/tag-utils", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/app/_utils/tag-utils")>();
+  const extract = (...args: any[]) => mockExtractHashtagsFromContent(...args);
+  return {
+    ...actual,
+    extractHashtagsFromContent: extract,
+    mergeTags: (stored: unknown, before: string, after: string) => {
+      const was = new Set(extract(before));
+      return actual.tagList([...actual.tagList(stored).filter((tag) => !was.has(tag)), ...extract(after)]);
+    },
+  };
+});
 
 vi.mock("@/app/_utils/encryption-utils", () => ({
   isEncrypted: vi.fn().mockReturnValue(false),
@@ -110,6 +126,16 @@ vi.mock("@/app/_utils/encryption-utils", () => ({
 }));
 
 import { createNote, deleteNote, updateNote } from "@/app/_server/actions/note";
+import { makeNote } from "@/app/_server/actions/note/creator";
+
+const EXISTING_NOTE = {
+  id: "test-note",
+  uuid: "test-uuid-123",
+  title: "Test Note",
+  category: "TestCategory",
+  owner: "testuser",
+  content: "Test content",
+};
 
 describe("Note Actions", () => {
   beforeEach(() => {
@@ -126,20 +152,70 @@ describe("Note Actions", () => {
       fileRenameMode: "minimal",
     });
     mockGetUsername.mockResolvedValue("testuser");
-    mockCheckUserPermission.mockResolvedValue(true);
+    mockCanReach.mockResolvedValue(true);
+    mockTargetDir.mockImplementation(
+      async (_mode: unknown, username: string, category: string) => ({
+        dir: `/data/notes/${username}/${category}`,
+        owner: username,
+        category,
+        isMount: false,
+        isImplicit: false,
+      }),
+    );
+    mockShownAs.mockImplementation(
+      async (
+        _mode: unknown,
+        _username: string,
+        _owner: string,
+        category: string,
+      ) => category,
+    );
+    mockBouncer.mockResolvedValue({ allowed: true });
+    mockRefusalMessage.mockResolvedValue("requiredPermissions");
+    mockMovePlan.mockImplementation(
+      async (
+        _mode: unknown,
+        username: string,
+        item: { owner?: string; category?: string },
+        requested: string,
+      ) => {
+        const home = {
+          owner: item.owner || username,
+          category: item.category || "",
+        };
+        const destination = { owner: username, category: requested };
+
+        return {
+          home,
+          destination,
+          target: {
+            dir: `/data/notes/${username}/${requested}`,
+            owner: username,
+            category: requested,
+            isMount: false,
+            isImplicit: false,
+          },
+          isMoving:
+            destination.owner !== home.owner ||
+            destination.category !== home.category,
+        };
+      },
+    );
     mockLogContentEvent.mockResolvedValue(undefined);
-    mockParseInternalLinks.mockResolvedValue([]);
-    mockUpdateIndexForItem.mockResolvedValue(undefined);
-    mockRemoveItemFromIndex.mockResolvedValue(undefined);
+    mockTidyItemLinks.mockImplementation(async (content: string) => content);
     mockCommitNote.mockResolvedValue(undefined);
     mockGetSettings.mockResolvedValue({});
     mockExtractHashtagsFromContent.mockReturnValue([]);
-    mockGenerateYamlFrontmatter.mockReturnValue("---\nuuid: test-uuid-123\n---\n");
+    mockGenerateYamlFrontmatter.mockReturnValue(
+      "---\nuuid: test-uuid-123\n---\n",
+    );
     mockExtractYamlMetadata.mockReturnValue({
       metadata: { uuid: "test-uuid-123" },
       contentWithoutMetadata: "Test content",
     });
     mockExtractTitle.mockReturnValue("Test Note");
+    mockStrayMeta.mockReturnValue(undefined);
+    mockKeptMeta.mockReturnValue(undefined);
     mockGetUserByNote.mockResolvedValue({ success: false });
     mockGetUserByNoteUuid.mockResolvedValue({ success: false });
   });
@@ -195,16 +271,36 @@ describe("Note Actions", () => {
       );
     });
 
-    it("should update link index after creation", async () => {
+    it("should canonicalise internal links before saving", async () => {
       const formData = createFormData({
         title: "Linked Note",
         category: "TestCategory",
-        rawContent: "Content with [[link]]",
+      rawContent: "See [Old](/jotty/3f2a1b4c-1111-4222-8333-944455556666)",
       });
+
+      mockTidyItemLinks.mockResolvedValueOnce("tidied body");
 
       await createNote(formData);
 
-      expect(mockUpdateIndexForItem).toHaveBeenCalled();
+      expect(mockTidyItemLinks).toHaveBeenCalledWith(expect.any(String), "testuser");
+      expect(mockServerWriteFile).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.stringContaining("tidied body"),
+      );
+    });
+
+    it("should return the body exactly as it is written to disk", async () => {
+      mockExtractYamlMetadata.mockReturnValue({
+        metadata: {},
+        contentWithoutMetadata: "\n\n\nhello\n",
+      });
+
+      const result = await createNote(
+        createFormData({ title: "Blank lead", category: "TestCategory", rawContent: "\n\n\nhello\n" }),
+      );
+
+      expect(result.data?.content).toBe("hello");
+      expect(mockServerWriteFile.mock.calls[0][1]).toMatch(/---\nhello$/);
     });
 
     it("should commit note to history", async () => {
@@ -238,7 +334,31 @@ describe("Note Actions", () => {
       expect(result.error).toBe("Failed to create note");
     });
 
-    it("should use user from formData when provided", async () => {
+    it("should refuse a category that escapes the owner's folder instead of filing it at the root", async () => {
+      mockTargetDir.mockResolvedValue({
+        dir: "/data/notes/testuser",
+        owner: "testuser",
+        category: "",
+        isMount: false,
+        isImplicit: false,
+      });
+
+      const formData = createFormData({
+        title: "Escapee",
+        category: "../elsewhere",
+        rawContent: "Content",
+      });
+
+      const result = await createNote(formData);
+
+      expect(result.success).toBeUndefined();
+      expect(result.error).toBeTruthy();
+      expect(mockServerWriteFile).not.toHaveBeenCalled();
+    });
+
+    it("should refuse forged formData identity when there is no session", async () => {
+      mockGetCurrentUser.mockResolvedValue(null);
+
       const formData = createFormData({
         title: "API Note",
         category: "TestCategory",
@@ -250,6 +370,61 @@ describe("Note Actions", () => {
       });
 
       const result = await createNote(formData);
+
+      expect(result.error).toBe("Not authenticated");
+      expect(mockServerWriteFile).not.toHaveBeenCalled();
+    });
+
+    it("should refuse a formData user that contradicts the session", async () => {
+      const formData = createFormData({
+        title: "Impersonation Attempt",
+        category: "TestCategory",
+        rawContent: "Content",
+        user: JSON.stringify({
+          username: "victim",
+          fileRenameMode: "minimal",
+        }),
+      });
+
+      const result = await createNote(formData);
+
+      expect(result.error).toBe("Identity mismatch");
+      expect(mockServerWriteFile).not.toHaveBeenCalled();
+    });
+
+    it("should create for the session user when the claim agrees", async () => {
+      const formData = createFormData({
+        title: "Agreeing Claim",
+        category: "TestCategory",
+        rawContent: "Content",
+        user: JSON.stringify({ username: "testuser" }),
+      });
+
+      const result = await createNote(formData);
+
+      expect(result.success).toBe(true);
+      expect(result.data?.owner).toBe("testuser");
+    });
+
+    it("should create for an api principal through makeNote", async () => {
+      mockGetCurrentUser.mockResolvedValue(null);
+      mockTargetDir.mockResolvedValue({
+        dir: "/data/notes/apiuser/TestCategory",
+        category: "TestCategory",
+        owner: "apiuser",
+        isMount: false,
+      });
+
+      const formData = createFormData({
+        title: "Api Key Note",
+        category: "TestCategory",
+        rawContent: "Content",
+      });
+
+      const result = await makeNote(
+        { username: "apiuser", fileRenameMode: "minimal" } as never,
+        formData,
+      );
 
       expect(result.success).toBe(true);
       expect(result.data?.owner).toBe("apiuser");
@@ -301,16 +476,40 @@ describe("Note Actions", () => {
     });
 
     it("should return error when permission denied", async () => {
-      mockCheckUserPermission.mockResolvedValue(false);
+      mockGetNoteById.mockResolvedValue(EXISTING_NOTE);
+      mockCanReach.mockResolvedValue(false);
 
       const formData = createFormData({
-        id: "test-note",
+        uuid: "test-uuid-123",
         category: "TestCategory",
       });
 
       const result = await deleteNote(formData);
 
-      expect(result.error).toBeDefined();
+      expect(result.error).toBe("Permission denied");
+      expect(mockServerDeleteFile).not.toHaveBeenCalled();
+    });
+
+    it("should return the bouncer verdict when the folder refuses", async () => {
+      mockGetNoteById.mockResolvedValue(EXISTING_NOTE);
+      mockCanReach.mockResolvedValue(true);
+      mockBouncer.mockResolvedValue({
+        allowed: false,
+        error:
+          "You don't have the required permissions to perform this action.",
+      });
+
+      const formData = createFormData({
+        uuid: "test-uuid-123",
+        category: "TestCategory",
+      });
+
+      const result = await deleteNote(formData);
+
+      expect(result.error).toBe(
+        "You don't have the required permissions to perform this action.",
+      );
+      expect(mockServerDeleteFile).not.toHaveBeenCalled();
     });
   });
 
@@ -386,12 +585,15 @@ describe("Note Actions", () => {
         expect(mockGenerateYamlFrontmatter).toHaveBeenCalledWith(
           expect.objectContaining({
             tags: ["work"],
-          })
+          }),
         );
       });
 
       it("should extract nested hashtags", async () => {
-        mockExtractHashtagsFromContent.mockReturnValue(["work/project", "personal/health"]);
+        mockExtractHashtagsFromContent.mockReturnValue([
+          "work/project",
+          "personal/health",
+        ]);
 
         const formData = createFormData({
           title: "Nested Tags Note",
@@ -461,6 +663,26 @@ describe("Note Actions", () => {
         mockExtractTitle.mockReturnValue("Test Note");
       };
 
+      it("should return the body exactly as it is written to disk", async () => {
+        setupUpdateNoteMocks();
+        mockExtractYamlMetadata.mockReturnValue({
+          metadata: {},
+          contentWithoutMetadata: "\n\n\nhello\n",
+        });
+
+        const result = await updateNote(
+          createFormData({
+            uuid: "test-uuid-123",
+            title: "Test Note",
+            content: "\n\n\nhello\n",
+            category: "TestCategory",
+          }),
+        );
+
+        expect(result.data?.content).toBe("hello");
+        expect(mockServerWriteFile.mock.calls[0][1]).toMatch(/---\nhello$/);
+      });
+
       it("should extract tags from updated content", async () => {
         setupUpdateNoteMocks();
         mockExtractHashtagsFromContent.mockReturnValue(["work", "project"]);
@@ -484,7 +706,11 @@ describe("Note Actions", () => {
 
       it("should sort extracted tags alphabetically", async () => {
         setupUpdateNoteMocks();
-        mockExtractHashtagsFromContent.mockReturnValue(["zebra", "alpha", "middle"]);
+        mockExtractHashtagsFromContent.mockReturnValue([
+          "zebra",
+          "alpha",
+          "middle",
+        ]);
 
         const formData = createFormData({
           id: "test-note",
@@ -522,7 +748,10 @@ describe("Note Actions", () => {
 
       it("should extract nested hashtags", async () => {
         setupUpdateNoteMocks();
-        mockExtractHashtagsFromContent.mockReturnValue(["work/project", "personal/health"]);
+        mockExtractHashtagsFromContent.mockReturnValue([
+          "work/project",
+          "personal/health",
+        ]);
 
         const formData = createFormData({
           id: "test-note",
@@ -590,7 +819,7 @@ describe("Note Actions", () => {
         expect(mockGenerateYamlFrontmatter).toHaveBeenCalledWith(
           expect.objectContaining({
             tags: ["save-tag"],
-          })
+          }),
         );
       });
 
@@ -639,7 +868,7 @@ describe("Note Actions", () => {
         expect(mockGenerateYamlFrontmatter).toHaveBeenCalledWith(
           expect.not.objectContaining({
             tags: expect.anything(),
-          })
+          }),
         );
       });
     });

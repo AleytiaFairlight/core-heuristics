@@ -1,12 +1,13 @@
 "use client";
 
 import { cn } from "@/app/_utils/global-utils";
-import { Checklist, Note, AppMode } from "@/app/_types";
+import { AppMode } from "@/app/_types";
 import { SearchInput } from "./Parts/SearchInput";
 import { SearchResults } from "./Parts/SearchResults";
 import { useSearch } from "@/app/_hooks/useSearch";
 import { useEffect } from "react";
 import { useTranslations } from "next-intl";
+import { MENU_CLASS } from "@/app/_consts/styling";
 
 interface SearchBarProps {
   mode: AppMode;
@@ -34,6 +35,8 @@ export const SearchBar = ({
     handleSelectResult,
     inputRef,
     containerRef,
+    isIndexing,
+    isSearching,
   } = useSearch({ mode, onModeChange, onResultSelect });
 
   useEffect(() => {
@@ -43,8 +46,6 @@ export const SearchBar = ({
       }, 100);
     }
   }, [autoFocus, inputRef]);
-
-  const translatedMode = mode === "notes" ? t('notes.title') : t('checklists.title')
 
   return (
     <div
@@ -57,18 +58,20 @@ export const SearchBar = ({
         onQueryChange={setQuery}
         onClear={() => setQuery("")}
         onFocus={() => setIsOpen(true)}
-        placeholder={t('common.searchPlaceholder')}
+        placeholder={t("common.searchPlaceholder")}
         inputRef={inputRef}
         className={cn("transition-all")}
       />
 
       {isOpen && query && (
-        <div className="absolute top-full left-0 right-0 mt-2 bg-background border border-border rounded-jotty shadow-lg z-50 overflow-hidden">
+        <div className={`absolute top-full left-0 right-0 mt-2 z-50 overflow-hidden ${MENU_CLASS}`}>
           <SearchResults
             results={results}
             selectedIndex={selectedIndex}
             onSelectResult={handleSelectResult}
             query={query}
+            indexing={isIndexing}
+            searching={isSearching}
           />
         </div>
       )}

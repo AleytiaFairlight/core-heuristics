@@ -63,7 +63,12 @@ export const AppSettingsTab = () => {
     try {
       const formData = new FormData();
       Object.entries(settings).forEach(([key, value]) =>
-        formData.append(key, value)
+        formData.append(
+          key,
+          typeof value === "object" && value !== null
+            ? JSON.stringify(value)
+            : String(value)
+        )
       );
 
       const result = await updateAppSettings(formData);
@@ -201,6 +206,41 @@ export const AppSettingsTab = () => {
             <span className="font-bold">
               {t("admin.parseContentPerformanceWarning")}
             </span>
+          </span>
+        </div>
+        <div>
+          <Label htmlFor="defaultDateFormat" className="block mb-3">
+            {t("admin.defaultDateFormat")}
+          </Label>
+          <Dropdown
+            value={settings?.defaultDateFormat || "dd/mm/yyyy"}
+            onChange={(value) => handleInputChange("defaultDateFormat", value)}
+            options={[
+              { id: "dd/mm/yyyy", name: "DD/MM/YYYY" },
+              { id: "mm/dd/yyyy", name: "MM/DD/YYYY" },
+              { id: "yyyy/mm/dd", name: "YYYY/MM/DD" },
+            ]}
+            disabled={!isSuperAdmin}
+          />
+          <span className="text-md lg:text-xs text-muted-foreground">
+            {t("admin.defaultDateFormatDescription")}
+          </span>
+        </div>
+        <div>
+          <Label htmlFor="defaultTimeFormat" className="block mb-3">
+            {t("admin.defaultTimeFormat")}
+          </Label>
+          <Dropdown
+            value={settings?.defaultTimeFormat || "12-hours"}
+            onChange={(value) => handleInputChange("defaultTimeFormat", value)}
+            options={[
+              { id: "12-hours", name: t("settings.hours12") },
+              { id: "24-hours", name: t("settings.hours24") },
+            ]}
+            disabled={!isSuperAdmin}
+          />
+          <span className="text-md lg:text-xs text-muted-foreground">
+            {t("admin.defaultTimeFormatDescription")}
           </span>
         </div>
         <div>

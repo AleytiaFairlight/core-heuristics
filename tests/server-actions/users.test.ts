@@ -7,16 +7,27 @@ const mockGetSessionId = vi.fn()
 const mockReadSessions = vi.fn()
 const mockLogUserEvent = vi.fn()
 const mockLogAudit = vi.fn()
+const mockRevokeGrants = vi.fn()
+const mockBroadcast = vi.fn()
+
+vi.mock('@/app/_server/actions/ws/broadcast', () => ({
+  broadcast: (...args: unknown[]) => mockBroadcast(...args),
+}))
 
 vi.mock('@/app/_server/actions/file', () => ({
   readJsonFile: (...args: any[]) => mockReadJsonFile(...args),
   writeJsonFile: (...args: any[]) => mockWriteJsonFile(...args),
 }))
 
-vi.mock('@/app/_server/actions/session', () => ({
+vi.mock('@/app/_server/actions/session/store', () => ({
   getSessionId: (...args: any[]) => mockGetSessionId(...args),
   readSessions: (...args: any[]) => mockReadSessions(...args),
   removeAllSessionsForUser: vi.fn().mockResolvedValue(undefined),
+}))
+
+vi.mock('@/app/_server/actions/share/rename', () => ({
+  revokeGrants: (...args: any[]) => mockRevokeGrants(...args),
+  renameGrants: vi.fn(),
 }))
 
 vi.mock('@/app/_server/actions/log', () => ({
@@ -26,13 +37,22 @@ vi.mock('@/app/_server/actions/log', () => ({
 
 import {
   createUser,
-  getUserByUsername,
+  getCurrentUser,
+  getPublicUser,
   hasUsers,
   updateProfile,
   deleteUser,
+  deleteAccount,
   getUsers,
+  getUsersForAdmin,
   updateUserSettings,
 } from '@/app/_server/actions/users'
+import { ensureUser } from '@/app/_server/actions/users/ensure-user'
+import { getCurrentUserRecord } from '@/app/_server/actions/users/records'
+import { createHash } from 'crypto'
+
+const hashOf = (password: string): string =>
+  createHash('sha256').update(password).digest('hex')
 
 describe('Users Actions', () => {
   beforeEach(() => {
@@ -43,10 +63,17 @@ describe('Users Actions', () => {
     mockReadSessions.mockResolvedValue({ 'session-123': 'testuser' })
     mockLogUserEvent.mockResolvedValue(undefined)
     mockLogAudit.mockResolvedValue(undefined)
+    mockRevokeGrants.mockResolvedValue(0)
     mockFs.rm.mockResolvedValue(undefined)
   })
 
   describe('createUser', () => {
+    beforeEach(() => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'testuser', passwordHash: 'hash', isAdmin: true },
+      ])
+    })
+
     it('should return error when fields are missing', async () => {
       const formData = createFormData({
         username: 'newuser',
@@ -101,6 +128,7 @@ describe('Users Actions', () => {
 
     it('should return error when username already exists', async () => {
       mockReadJsonFile.mockResolvedValue([
+        { username: 'testuser', passwordHash: 'hash', isAdmin: true },
         { username: 'existinguser', passwordHash: 'hash', isAdmin: false },
       ])
 
@@ -117,7 +145,9 @@ describe('Users Actions', () => {
     })
 
     it('should create user successfully', async () => {
-      mockReadJsonFile.mockResolvedValue([])
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'testuser', passwordHash: 'hash', isAdmin: true },
+      ])
 
       const formData = createFormData({
         username: 'newuser',
@@ -137,7 +167,9 @@ describe('Users Actions', () => {
     })
 
     it('should create admin user when specified', async () => {
-      mockReadJsonFile.mockResolvedValue([])
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'testuser', passwordHash: 'hash', isAdmin: true },
+      ])
 
       const formData = createFormData({
         username: 'adminuser',
@@ -153,25 +185,176 @@ describe('Users Actions', () => {
     })
   })
 
-  describe('getUserByUsername', () => {
+  describe('getPublicUser', () => {
     it('should return null when user not found', async () => {
       mockReadJsonFile.mockResolvedValue([])
 
-      const result = await getUserByUsername('nonexistent')
+      const result = await getPublicUser('nonexistent')
 
       expect(result).toBeNull()
     })
 
-    it('should return user when found', async () => {
+    it('should return public display fields when found', async () => {
       mockReadJsonFile.mockResolvedValue([
-        { username: 'testuser', passwordHash: 'hash', isAdmin: true },
+        {
+          username: 'testuser',
+          passwordHash: 'hash',
+          isAdmin: true,
+          isSuperAdmin: false,
+          avatarUrl: '/uploads/avatar.png',
+        },
       ])
 
-      const result = await getUserByUsername('testuser')
+      const result = await getPublicUser('testuser')
+
+      expect(result).toEqual({
+        username: 'testuser',
+        isAdmin: true,
+        isSuperAdmin: false,
+        avatarUrl: '/uploads/avatar.png',
+      })
+    })
+
+    it('should never expose credentials or mfa secrets', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        {
+          username: 'victim',
+          passwordHash: 'victim_hash',
+          apiKey: 'victim_api_key',
+          mfaSecret: 'victim_mfa_secret',
+          mfaRecoveryCode: 'victim_recovery_code',
+          lastLogin: '2024-01-01',
+          isAdmin: false,
+        },
+      ])
+
+      const result = await getPublicUser('victim')
 
       expect(result).not.toBeNull()
+      expect(result).not.toHaveProperty('passwordHash')
+      expect(result).not.toHaveProperty('apiKey')
+      expect(result).not.toHaveProperty('mfaSecret')
+      expect(result).not.toHaveProperty('mfaRecoveryCode')
+      expect(result).not.toHaveProperty('lastLogin')
+      expect(JSON.stringify(result)).not.toContain('victim_hash')
+      expect(JSON.stringify(result)).not.toContain('victim_api_key')
+      expect(JSON.stringify(result)).not.toContain('victim_mfa_secret')
+      expect(JSON.stringify(result)).not.toContain('victim_recovery_code')
+    })
+  })
+
+  describe('getCurrentUser', () => {
+    const sessionRecord = {
+      username: 'testuser',
+      passwordHash: 'session_hash',
+      apiKey: 'session_api_key',
+      mfaSecret: 'session_mfa_secret',
+      mfaRecoveryCode: 'session_recovery_code',
+      lastLogin: '2024-01-01',
+      isAdmin: true,
+      preferredTheme: 'dark',
+    }
+
+    it('should return the session user without credentials or mfa secrets', async () => {
+      mockReadJsonFile.mockResolvedValue([sessionRecord])
+
+      const result = await getCurrentUser()
+
       expect(result?.username).toBe('testuser')
       expect(result?.isAdmin).toBe(true)
+      expect(result?.preferredTheme).toBe('dark')
+      expect(result).not.toHaveProperty('passwordHash')
+      expect(result).not.toHaveProperty('apiKey')
+      expect(result).not.toHaveProperty('mfaSecret')
+      expect(result).not.toHaveProperty('mfaRecoveryCode')
+      expect(result).not.toHaveProperty('lastLogin')
+    })
+
+    it('should not hand back the stored record itself', async () => {
+      mockReadJsonFile.mockResolvedValue([sessionRecord])
+
+      const result = await getCurrentUser()
+
+      expect(result).not.toBe(sessionRecord)
+      expect(sessionRecord.passwordHash).toBe('session_hash')
+    })
+
+    it('getCurrentUserRecord should keep secrets available server side', async () => {
+      mockReadJsonFile.mockResolvedValue([sessionRecord])
+
+      const record = await getCurrentUserRecord()
+
+      expect(record?.passwordHash).toBe('session_hash')
+      expect(record?.apiKey).toBe('session_api_key')
+      expect(record?.mfaSecret).toBe('session_mfa_secret')
+      expect(record?.mfaRecoveryCode).toBe('session_recovery_code')
+    })
+  })
+
+  describe('credential dependent flows', () => {
+    const passwordRecord = {
+      username: 'testuser',
+      passwordHash: hashOf('correct-horse'),
+      isAdmin: false,
+    }
+
+    it('updateProfile should reject a wrong current password', async () => {
+      mockReadJsonFile.mockResolvedValue([passwordRecord])
+
+      const result = await updateProfile(
+        createFormData({
+          newUsername: 'testuser',
+          currentPassword: 'wrong-password',
+          newPassword: 'brand-new-password',
+        })
+      )
+
+      expect(result.success).toBe(false)
+      expect(result.error).toBe('Current password is incorrect')
+      expect(mockWriteJsonFile).not.toHaveBeenCalled()
+    })
+
+    it('updateProfile should accept the correct current password', async () => {
+      mockReadJsonFile.mockResolvedValue([passwordRecord])
+
+      const result = await updateProfile(
+        createFormData({
+          newUsername: 'testuser',
+          currentPassword: 'correct-horse',
+          newPassword: 'brand-new-password',
+        })
+      )
+
+      expect(result.success).toBe(true)
+
+      const [written] = mockWriteJsonFile.mock.calls[0]
+      expect(written[0].passwordHash).toBe(hashOf('brand-new-password'))
+    })
+
+    it('deleteAccount should reject a wrong confirmation password', async () => {
+      mockReadJsonFile.mockResolvedValue([passwordRecord])
+
+      const result = await deleteAccount(
+        createFormData({ confirmPassword: 'wrong-password' })
+      )
+
+      expect(result.success).toBe(false)
+      expect(result.error).toBe('Incorrect password')
+    })
+
+    it('deleteAccount should accept the correct confirmation password', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        passwordRecord,
+        { username: 'someoneelse', passwordHash: 'other', isAdmin: true },
+      ])
+
+      const result = await deleteAccount(
+        createFormData({ confirmPassword: 'correct-horse' })
+      )
+
+      expect(result.success).toBe(true)
+      expect(mockWriteJsonFile).toHaveBeenCalled()
+      expect(mockRevokeGrants).toHaveBeenCalledWith('testuser')
     })
   })
 
@@ -212,7 +395,19 @@ describe('Users Actions', () => {
       expect(result).toEqual([])
     })
 
+    it('should return nothing without a session', async () => {
+      mockGetSessionId.mockResolvedValue('')
+      mockReadSessions.mockResolvedValue({})
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'user1', passwordHash: 'secret', isAdmin: true },
+      ])
+
+      expect(await getUsers()).toEqual([])
+    })
+
     it('should return users without password hash', async () => {
+      mockGetSessionId.mockResolvedValue('sid')
+      mockReadSessions.mockResolvedValue({ sid: 'user1' })
       mockReadJsonFile.mockResolvedValue([
         { username: 'user1', passwordHash: 'secret', isAdmin: true, isSuperAdmin: false, avatarUrl: '/avatar.png' },
         { username: 'user2', passwordHash: 'secret2', isAdmin: false, isSuperAdmin: false },
@@ -233,6 +428,50 @@ describe('Users Actions', () => {
         isSuperAdmin: false,
         avatarUrl: undefined,
       })
+    })
+  })
+
+  describe('getUsersForAdmin', () => {
+    it('should return empty array when caller is not admin', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'regularuser', passwordHash: 'hash', isAdmin: false },
+      ])
+      mockReadSessions.mockResolvedValue({ 'session-123': 'regularuser' })
+
+      const result = await getUsersForAdmin()
+
+      expect(result).toEqual([])
+    })
+
+    it('should return sanitized users (no passwordHash/apiKey/mfaSecret) when caller is admin', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'adminuser', passwordHash: 'secret', isAdmin: true, isSuperAdmin: true, avatarUrl: '/admin.png' },
+        { username: 'regularuser', passwordHash: 'secret2', isAdmin: false, isSuperAdmin: false, apiKey: 'ck_test', mfaSecret: 'totp-secret' },
+      ])
+      mockReadSessions.mockResolvedValue({ 'session-123': 'adminuser' })
+
+      const result = await getUsersForAdmin()
+
+      expect(result).toHaveLength(2)
+      expect(result[0].username).toBe('adminuser')
+      expect(result[0].isAdmin).toBe(true)
+      expect(result[0]).not.toHaveProperty('passwordHash')
+      expect(result[0]).not.toHaveProperty('apiKey')
+      expect(result[0]).not.toHaveProperty('mfaSecret')
+      expect(result[1].username).toBe('regularuser')
+      expect(result[1].isAdmin).toBe(false)
+      expect(result[1]).not.toHaveProperty('passwordHash')
+      expect(result[1]).not.toHaveProperty('apiKey')
+      expect(result[1]).not.toHaveProperty('mfaSecret')
+    })
+
+    it('should return empty array when users file is empty', async () => {
+      mockReadJsonFile.mockResolvedValue([])
+      mockReadSessions.mockResolvedValue({ 'session-123': 'adminuser' })
+
+      const result = await getUsersForAdmin()
+
+      expect(result).toEqual([])
     })
   })
 
@@ -282,6 +521,107 @@ describe('Users Actions', () => {
 
       expect(result.success).toBe(false)
       expect(result.error).toBe('Cannot delete the super admin (system owner)')
+      expect(mockRevokeGrants).not.toHaveBeenCalled()
+    })
+
+    it('should revoke every share granted to the deleted user and drop their record', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'adminuser', passwordHash: 'hash', isAdmin: true },
+        { username: 'leaver', passwordHash: 'hash', isAdmin: false },
+      ])
+      mockReadSessions.mockResolvedValue({ 'session-123': 'adminuser' })
+
+      const result = await deleteUser(createFormData({ username: 'leaver' }))
+
+      expect(result.success).toBe(true)
+      expect(mockRevokeGrants).toHaveBeenCalledWith('leaver')
+      expect(mockLock).toHaveBeenCalled()
+
+      const [written] = mockWriteJsonFile.mock.calls.at(-1)!
+      expect(written.map((user: { username: string }) => user.username)).toEqual(['adminuser'])
+    })
+  })
+
+  describe('ensureUser()', () => {
+    beforeEach(() => {
+      mockFs.mkdir.mockResolvedValue(undefined)
+      mockFs.writeFile.mockResolvedValue(undefined)
+      mockLock.mockResolvedValue(undefined)
+      mockUnlock.mockResolvedValue(undefined)
+    })
+
+    it('creates the first user as both admin and superAdmin', async () => {
+      mockReadJsonFile.mockResolvedValue([])
+      await ensureUser('alice', false)
+      const written = mockWriteJsonFile.mock.calls[0][0]
+      expect(written).toHaveLength(1)
+      expect(written[0]).toMatchObject({ username: 'alice', isAdmin: true, isSuperAdmin: true })
+    })
+
+    it('creates a subsequent user with isAdmin=false when false is passed', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'existing', passwordHash: '', isAdmin: true, isSuperAdmin: true },
+      ])
+      await ensureUser('bob', false)
+      const written = mockWriteJsonFile.mock.calls[0][0]
+      const bob = written.find((u: any) => u.username === 'bob')
+      expect(bob).toBeDefined()
+      expect(bob.isAdmin).toBe(false)
+      expect(bob.isSuperAdmin).toBeUndefined()
+    })
+
+    it('creates a subsequent user with isAdmin=true when true is passed', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'existing', passwordHash: '', isAdmin: true, isSuperAdmin: true },
+      ])
+      await ensureUser('bob', true)
+      const written = mockWriteJsonFile.mock.calls[0][0]
+      const bob = written.find((u: any) => u.username === 'bob')
+      expect(bob.isAdmin).toBe(true)
+    })
+
+    it('promotes an existing non-admin user to admin when isAdmin=true', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'existing', passwordHash: '', isAdmin: true, isSuperAdmin: true },
+        { username: 'alice', passwordHash: '', isAdmin: false },
+      ])
+      await ensureUser('alice', true)
+      const written = mockWriteJsonFile.mock.calls[0][0]
+      const alice = written.find((u: any) => u.username === 'alice')
+      expect(alice.isAdmin).toBe(true)
+    })
+
+    it('does NOT demote an existing admin user when isAdmin=false', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'alice', passwordHash: '', isAdmin: true },
+      ])
+      await ensureUser('alice', false)
+      const written = mockWriteJsonFile.mock.calls[0][0]
+      const alice = written.find((u: any) => u.username === 'alice')
+      expect(alice.isAdmin).toBe(true)
+    })
+
+    it('does not create a duplicate entry if called with an existing username', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'alice', passwordHash: '', isAdmin: false },
+      ])
+      await ensureUser('alice', false)
+      const written = mockWriteJsonFile.mock.calls[0][0]
+      expect(written.filter((u: any) => u.username === 'alice')).toHaveLength(1)
+    })
+
+    it('refuses to overwrite a users file it cannot read', async () => {
+      mockReadJsonFile.mockResolvedValue(null)
+      await expect(ensureUser('alice', false)).rejects.toThrow()
+      expect(mockWriteJsonFile).not.toHaveBeenCalled()
+    })
+
+    it('creates the checklist and notes directories for the user', async () => {
+      mockReadJsonFile.mockResolvedValue([])
+      await ensureUser('alice', false)
+      const mkdirPaths = mockFs.mkdir.mock.calls.map((c: any[]) => c[0] as string)
+      expect(mkdirPaths.some((p) => p.includes('checklists') && p.includes('alice'))).toBe(true)
+      expect(mkdirPaths.some((p) => p.includes('notes') && p.includes('alice'))).toBe(true)
     })
   })
 
@@ -309,6 +649,241 @@ describe('Users Actions', () => {
         level: 'INFO',
         action: 'user_settings_updated',
         success: true,
+      }))
+    })
+
+    it('should save where new checklist items go', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'testuser', passwordHash: 'hash', isAdmin: false, newItemInsertion: 'top' },
+      ])
+
+      const result = await updateUserSettings({ newItemInsertion: 'bottom' })
+
+      expect(result.success).toBe(true)
+      expect(result.data?.user.newItemInsertion).toBe('bottom')
+    })
+
+    it('should clamp the note font size before saving it', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'testuser', passwordHash: 'hash', isAdmin: false },
+      ])
+
+      const tooBig = await updateUserSettings({ notesFontSize: 400 })
+      expect(tooBig.data?.user.notesFontSize).toBe(24)
+
+      const sneaky = await updateUserSettings({ notesFontSize: '18px; color: red' as unknown as number })
+      expect(sneaky.data?.user.notesFontSize).toBe(0)
+
+      const reset = await updateUserSettings({ notesFontSize: 0 })
+      expect(reset.data?.user.notesFontSize).toBe(0)
+    })
+
+    it('should return the updated user without credentials or mfa secrets', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        {
+          username: 'testuser',
+          passwordHash: 'settings_hash',
+          apiKey: 'settings_api_key',
+          mfaSecret: 'settings_mfa_secret',
+          mfaRecoveryCode: 'settings_recovery_code',
+          lastLogin: '2024-01-01',
+          isAdmin: false,
+          preferredDateFormat: 'dd/mm/yyyy',
+        },
+      ])
+
+      const result = await updateUserSettings({ preferredDateFormat: 'mm/dd/yyyy' })
+
+      expect(result.success).toBe(true)
+      expect(result.data?.user.preferredDateFormat).toBe('mm/dd/yyyy')
+      expect(result.data?.user).not.toHaveProperty('passwordHash')
+      expect(result.data?.user).not.toHaveProperty('apiKey')
+      expect(result.data?.user).not.toHaveProperty('mfaSecret')
+      expect(result.data?.user).not.toHaveProperty('mfaRecoveryCode')
+      expect(result.data?.user).not.toHaveProperty('lastLogin')
+    })
+
+    it('should ignore privilege fields sent by the caller', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'testuser', passwordHash: 'hash', isAdmin: false, preferredTheme: 'light' },
+      ])
+
+      const result = await updateUserSettings({
+        preferredTheme: 'dark',
+        isAdmin: true,
+        isSuperAdmin: true,
+      } as any)
+
+      expect(result.success).toBe(true)
+
+      const written = mockWriteJsonFile.mock.calls.at(-1)?.[0]
+      expect(written[0].isAdmin).toBe(false)
+      expect(written[0].isSuperAdmin).toBeUndefined()
+      expect(written[0].preferredTheme).toBe('dark')
+      expect(result.data?.user.isAdmin).toBe(false)
+    })
+
+    it('should ignore credential fields sent by the caller', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        {
+          username: 'testuser',
+          passwordHash: 'original_hash',
+          apiKey: 'original_key',
+          mfaEnabled: true,
+          mfaSecret: 'original_secret',
+          isAdmin: false,
+        },
+      ])
+
+      const result = await updateUserSettings({
+        passwordHash: 'attacker_hash',
+        apiKey: 'attacker_key',
+        mfaEnabled: false,
+        mfaSecret: 'attacker_secret',
+        username: 'admin',
+      } as any)
+
+      expect(result.success).toBe(true)
+
+      const written = mockWriteJsonFile.mock.calls.at(-1)?.[0]
+      expect(written[0].passwordHash).toBe('original_hash')
+      expect(written[0].apiKey).toBe('original_key')
+      expect(written[0].mfaEnabled).toBe(true)
+      expect(written[0].mfaSecret).toBe('original_secret')
+      expect(written[0].username).toBe('testuser')
+    })
+
+    it('should keep the stored custom key path when encryption settings change', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        {
+          username: 'testuser',
+          passwordHash: 'hash',
+          isAdmin: false,
+          encryptionSettings: {
+            method: 'pgp',
+            hasKeys: true,
+            autoDecrypt: true,
+            customKeyPath: '/safe/path',
+          },
+        },
+      ])
+
+      const result = await updateUserSettings({
+        encryptionSettings: {
+          method: 'xchacha',
+          hasKeys: true,
+          autoDecrypt: false,
+          customKeyPath: '/etc/passwd',
+        },
+      })
+
+      expect(result.success).toBe(true)
+
+      const written = mockWriteJsonFile.mock.calls.at(-1)?.[0]
+      expect(written[0].encryptionSettings.customKeyPath).toBe('/safe/path')
+      expect(written[0].encryptionSettings.method).toBe('xchacha')
+      expect(written[0].encryptionSettings.autoDecrypt).toBe(false)
+    })
+
+    it('should clear an editable setting so it follows the default again', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'testuser', passwordHash: 'hash', isAdmin: false, handedness: 'left-handed', preferredBorderRadius: 1 },
+      ])
+
+      const result = await updateUserSettings({ handedness: null, preferredBorderRadius: null })
+
+      expect(result.success).toBe(true)
+      const written = mockWriteJsonFile.mock.calls.at(-1)?.[0]
+      expect(written[0]).not.toHaveProperty('handedness')
+      expect(written[0]).not.toHaveProperty('preferredBorderRadius')
+      expect(result.data?.user).not.toHaveProperty('handedness')
+      expect(mockLogAudit).toHaveBeenCalledWith(expect.objectContaining({
+        action: 'user_settings_updated',
+        metadata: expect.objectContaining({ settingsCleared: ['preferredBorderRadius', 'handedness'] }),
+      }))
+    })
+
+    it('should refuse to clear a field that is not an editable setting', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'testuser', passwordHash: 'hash', isAdmin: true, apiKey: 'key', mfaSecret: 'secret' },
+      ])
+
+      await updateUserSettings({ isAdmin: null, passwordHash: null, apiKey: null, mfaSecret: null, username: null })
+
+      const written = mockWriteJsonFile.mock.calls.at(-1)?.[0]
+      expect(written[0]).toMatchObject({ username: 'testuser', passwordHash: 'hash', isAdmin: true, apiKey: 'key', mfaSecret: 'secret' })
+      expect(mockLogAudit).toHaveBeenCalledWith(expect.objectContaining({
+        action: 'user_settings_rejected',
+        metadata: expect.objectContaining({
+          rejected: ['isAdmin', 'passwordHash', 'apiKey', 'mfaSecret', 'username'],
+        }),
+      }))
+    })
+
+    it('should not let null wipe encryption settings', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'testuser', passwordHash: 'hash', isAdmin: false, encryptionSettings: { method: 'pgp', hasKeys: true, autoDecrypt: true } },
+      ])
+
+      await updateUserSettings({ encryptionSettings: null })
+
+      const written = mockWriteJsonFile.mock.calls.at(-1)?.[0]
+      expect(written[0].encryptionSettings).toEqual({ method: 'pgp', hasKeys: true, autoDecrypt: true })
+    })
+
+    it('should keep validating values next to a cleared field', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'testuser', passwordHash: 'hash', isAdmin: false, browseViewMode: 'list', preferredBorderRadius: 1 },
+      ])
+
+      const result = await updateUserSettings({
+        browseViewMode: 'carousel' as never,
+        preferredBorderRadius: 'huge' as never,
+        notesFontSize: 400,
+        handedness: null,
+      })
+
+      const written = mockWriteJsonFile.mock.calls.at(-1)?.[0]
+      expect(written[0].browseViewMode).toBe('list')
+      expect(written[0].preferredBorderRadius).toBe(1)
+      expect(written[0].notesFontSize).toBe(24)
+      expect(result.data?.user.notesFontSize).toBe(24)
+    })
+
+    it('should keep reading old records that store explicit default values', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'testuser', passwordHash: 'hash', isAdmin: false, notesFontSize: 0, kanbanColumnWidth: 0, landingPage: 'checklists' },
+      ])
+
+      const result = await updateUserSettings({ handedness: 'left-handed' })
+
+      expect(result.data?.user).toMatchObject({ notesFontSize: 0, kanbanColumnWidth: 0, landingPage: 'checklists', handedness: 'left-handed' })
+    })
+
+    it('should broadcast a settings change only to the user who made it', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'testuser', passwordHash: 'hash', isAdmin: false },
+      ])
+
+      await updateUserSettings({ handedness: 'left-handed' })
+
+      expect(mockBroadcast).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'settings',
+        recipient: 'testuser',
+      }))
+    })
+
+    it('should audit rejected fields', async () => {
+      mockReadJsonFile.mockResolvedValue([
+        { username: 'testuser', passwordHash: 'hash', isAdmin: false },
+      ])
+
+      await updateUserSettings({ isAdmin: true } as any)
+
+      expect(mockLogAudit).toHaveBeenCalledWith(expect.objectContaining({
+        action: 'user_settings_rejected',
+        success: false,
+        metadata: expect.objectContaining({ rejected: ['isAdmin'] }),
       }))
     })
   })

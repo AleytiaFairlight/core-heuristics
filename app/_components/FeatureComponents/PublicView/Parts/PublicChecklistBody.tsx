@@ -1,15 +1,18 @@
-import { Checklist, Item } from "@/app/_types";
+import { Checklist } from "@/app/_types";
 import { CheckmarkSquare04Icon } from "hugeicons-react";
 import { TaskStatusSection } from "./TaskStatusSection";
 import { useMemo } from "react";
-import { TaskStatus } from "@/app/_types/enums";
+import { isKanbanType } from "@/app/_types/enums";
+import { boardColumns } from "@/app/_utils/kanban/board-utils";
 import { NestedChecklistItem } from "../../Checklists/Parts/Simple/NestedChecklistItem";
 import { useTranslations } from "next-intl";
 
 export const PublicChecklistBody = ({
   checklist,
+  ownerShowsEmojis,
 }: {
   checklist: Checklist;
+  ownerShowsEmojis?: boolean;
 }) => {
   const t = useTranslations();
   const { totalCount } = useMemo(() => {
@@ -20,20 +23,10 @@ export const PublicChecklistBody = ({
     };
   }, [checklist.items]);
 
-  const taskItemsByStatus = useMemo(() => {
-    if (checklist.type !== "task") return null;
-    const initialAcc: Record<string, Item[]> = {
-      todo: [],
-      in_progress: [],
-      paused: [],
-      completed: [],
-    };
-    return checklist.items.reduce((acc, item) => {
-      const status = item.status || TaskStatus.TODO;
-      if (acc[status]) acc[status].push(item);
-      return acc;
-    }, initialAcc);
-  }, [checklist.items, checklist.type]);
+  const statusColumns = useMemo(
+    () => (isKanbanType(checklist.type) ? boardColumns(checklist) : null),
+    [checklist],
+  );
 
   if (totalCount === 0) {
     return (
@@ -42,14 +35,22 @@ export const PublicChecklistBody = ({
         <h3 className="text-lg font-medium text-foreground mb-2">
           {t("checklists.noItemsYet")}
         </h3>
-        <p className="text-muted-foreground">{t("checklists.emptyChecklist")}</p>
+        <p className="text-muted-foreground">
+          {t("checklists.emptyChecklist")}
+        </p>
       </div>
     );
   }
 
-  if (checklist.type === "task" && taskItemsByStatus) {
-    return Object.entries(taskItemsByStatus).map(([status, items]) => (
-      <TaskStatusSection key={status} status={status} items={items} checklist={checklist} />
+  if (statusColumns) {
+    return statusColumns.map(({ status, items }) => (
+      <TaskStatusSection
+        key={status.id}
+        status={status}
+        items={items}
+        checklist={checklist}
+        ownerShowsEmojis={ownerShowsEmojis}
+      />
     ));
   }
 
@@ -61,9 +62,10 @@ export const PublicChecklistBody = ({
           item={item}
           index={index.toString()}
           level={0}
-          onToggle={() => { }}
-          onDelete={() => { }}
+          onToggle={() => {}}
+          onDelete={() => {}}
           isPublicView={true}
+          ownerShowsEmojis={ownerShowsEmojis}
           isDeletingItem={false}
           isDragDisabled={true}
           checklist={checklist}

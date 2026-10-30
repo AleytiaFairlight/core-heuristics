@@ -5,22 +5,58 @@ import path from "path";
 import * as openpgp from "openpgp";
 import { getCurrentUser } from "@/app/_server/actions/users";
 import { updateUserSettings } from "@/app/_server/actions/users";
+import { patchUserFields } from "@/app/_server/actions/users/records";
+import { sanitizeUserForClient } from "@/app/_utils/user-sanitize-utils";
 import {
   ensureDir,
   serverWriteFile,
   serverReadFile,
   serverDeleteFile,
 } from "@/app/_server/actions/file";
-import { Result, User } from "@/app/_types";
+import { Result, SanitisedUser } from "@/app/_types";
 import { PGPKeyMetadata } from "@/app/_types";
 import { logAudit } from "@/app/_server/actions/log";
+import { DATA_DIR } from "@/app/_consts/files";
+
+const _defaultKeyDir = (username: string): string =>
+  path.join(process.cwd(), DATA_DIR, "encryption", username);
+
+const _realOr = async (target: string): Promise<string> => {
+  try {
+    return await fs.realpath(target);
+  } catch {
+    return path.resolve(target);
+  }
+};
+
+const _keyPathTrespasses = async (
+  username: string,
+  customPath: string,
+): Promise<boolean> => {
+  if (!path.isAbsolute(customPath) || customPath.includes("\0")) return true;
+
+  const real = await _realOr(customPath);
+  const dataRoot = await _realOr(path.join(process.cwd(), DATA_DIR));
+  const ownDir = await _realOr(_defaultKeyDir(username));
+  const within = (base: string) =>
+    real === base || real.startsWith(base + path.sep);
+
+  return within(dataRoot) && !within(ownDir);
+};
 
 const _getEncryptionDir = async (username: string): Promise<string> => {
   const user = await getCurrentUser();
-  if (user?.encryptionSettings?.customKeyPath) {
-    return user.encryptionSettings.customKeyPath;
+  const customPath = user?.encryptionSettings?.customKeyPath;
+
+  if (customPath && !(await _keyPathTrespasses(username, customPath))) {
+    return customPath;
   }
-  return path.join(process.cwd(), "data", "encryption", username);
+
+  if (customPath) {
+    console.warn("Ignoring custom key path inside the data folder for", username);
+  }
+
+  return _defaultKeyDir(username);
 };
 
 export const generateKeyPair = async (
@@ -463,7 +499,7 @@ export const decryptNoteContent = async (
 
 export const setCustomKeyPath = async (
   customPath: string
-): Promise<Result<{ user: User }>> => {
+): Promise<Result<{ user: SanitisedUser }>> => {
   try {
     const user = await getCurrentUser();
     if (!user?.username) {
@@ -476,7 +512,14 @@ export const setCustomKeyPath = async (
       return { success: false, error: "Custom path is not accessible" };
     }
 
-    const result = await updateUserSettings({
+    if (await _keyPathTrespasses(user.username, customPath)) {
+      return {
+        success: false,
+        error: "Custom path must be absolute and outside the data folder",
+      };
+    }
+
+    const saved = await patchUserFields(user.username, {
       encryptionSettings: {
         method: user.encryptionSettings?.method || "pgp",
         hasKeys: user.encryptionSettings?.hasKeys ?? false,
@@ -485,17 +528,17 @@ export const setCustomKeyPath = async (
       },
     });
 
-    if (!result.success || !result.data) {
+    if (!saved) {
       await logAudit({
         level: "ERROR",
         action: "encryption_key_path_changed",
         category: "encryption",
         success: false,
-        errorMessage: result.error || "Failed to set custom key path",
+        errorMessage: "Failed to set custom key path",
       });
       return {
         success: false,
-        error: result.error || "Failed to set custom key path",
+        error: "Failed to set custom key path",
       };
     }
 
@@ -507,7 +550,7 @@ export const setCustomKeyPath = async (
       metadata: { customPath },
     });
 
-    return { success: true, data: { user: result.data.user } };
+    return { success: true, data: { user: sanitizeUserForClient(saved)! } };
   } catch (error) {
     console.error("Error setting custom key path:", error);
     await logAudit({

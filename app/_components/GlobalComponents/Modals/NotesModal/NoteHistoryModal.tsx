@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { GitCompareIcon } from "hugeicons-react";
 import { Button } from "@/app/_components/GlobalComponents/Buttons/Button";
-import { Modal } from "../Modal";
+import { Modal, ModalWidth, ModalVariant } from "../Modal";
 import { useTranslations } from "next-intl";
 import {
   getHistory,
@@ -27,8 +27,6 @@ interface NoteHistoryModalProps {
   isOpen: boolean;
   onClose: () => void;
   noteUuid: string;
-  noteId: string;
-  noteCategory: string;
   noteOwner: string;
   noteTitle: string;
   currentContent?: string;
@@ -41,8 +39,6 @@ export const NoteHistoryModal = ({
   isOpen,
   onClose,
   noteUuid,
-  noteId,
-  noteCategory,
   noteOwner,
   noteTitle,
   currentContent = "",
@@ -93,8 +89,6 @@ export const NoteHistoryModal = ({
 
         const result = await getHistory(
           noteUuid,
-          noteId,
-          noteCategory,
           noteOwner,
           pageNum,
           20
@@ -118,7 +112,7 @@ export const NoteHistoryModal = ({
         setIsLoadingMore(false);
       }
     },
-    [noteUuid, noteId, noteCategory, noteOwner, t, appSettings, currentUser]
+    [noteUuid, noteOwner, t, appSettings, currentUser]
   );
 
   const fetchVersion = useCallback(
@@ -130,8 +124,6 @@ export const NoteHistoryModal = ({
       try {
         const result = await getVersion(
           noteUuid,
-          noteId,
-          noteCategory,
           noteOwner,
           entry.commitHash
         );
@@ -148,7 +140,7 @@ export const NoteHistoryModal = ({
         setIsLoadingVersion(false);
       }
     },
-    [noteUuid, noteId, noteCategory, noteOwner, t]
+    [noteUuid, noteOwner, t]
   );
 
   useEffect(() => {
@@ -181,8 +173,6 @@ export const NoteHistoryModal = ({
     try {
       const result = await restoreNoteVersion(
         noteUuid,
-        noteId,
-        noteCategory,
         noteOwner,
         restoreTarget.commitHash
       );
@@ -220,7 +210,15 @@ export const NoteHistoryModal = ({
             <span>{t("history.noteHistory")}</span>
           </div>
         }
-        className="lg:!max-w-3xl"
+        variant={ModalVariant.PANEL}
+        width={ModalWidth.WIDE}
+        footer={(close) => (
+          <div className="flex justify-end">
+            <Button variant="outline" onClick={close}>
+              {t("common.close")}
+            </Button>
+          </div>
+        )}
       >
         <div className="space-y-4">
           {error === "HISTORY_DISABLED_ADMIN" ||
@@ -273,12 +271,6 @@ export const NoteHistoryModal = ({
               onRestore={setRestoreTarget}
             />
           )}
-
-          <div className="flex justify-end pt-4 border-t border-border">
-            <Button variant="outline" onClick={onClose}>
-              {t("common.close")}
-            </Button>
-          </div>
         </div>
       </Modal>
 

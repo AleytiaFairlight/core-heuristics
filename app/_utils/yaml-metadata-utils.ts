@@ -1,9 +1,9 @@
 import yaml from "js-yaml";
 import { v4 as uuidv4 } from "uuid";
+import { ChecklistsTypes, isKanbanType } from "../_types/enums";
+import { titleOf } from "./title-utils";
 
-export const toIso = (
-  d: Date | string | number | undefined | null,
-): string => {
+export const toIso = (d: Date | string | number | undefined | null): string => {
   if (d == null) return new Date(0).toISOString();
   const date = d instanceof Date ? d : new Date(d as string | number);
   return Number.isFinite(date.getTime())
@@ -11,17 +11,75 @@ export const toIso = (
     : new Date(0).toISOString();
 };
 
+export const createdAtOf = (
+  metadata: Record<string, unknown> | null | undefined,
+  birthtime: Date,
+): string => {
+  const stamped = metadata?.[OwnedMetaKeys.CREATED_AT];
+  return stamped instanceof Date || typeof stamped === "string"
+    ? toIso(stamped)
+    : toIso(birthtime);
+};
+
 export interface DocumentMetadata {
   uuid?: string;
   title?: string;
-  checklistType?: "task" | "simple";
+  checklistType?: "task" | "simple" | "kanban";
   [key: string]: any;
 }
 
 const YAML_FRONTMATTER_REGEX = /^\uFEFF?---\r?\n([\s\S]*?)\r?\n---(?:\r?\n)?/;
 
+export enum OwnedMetaKeys {
+  UUID = "uuid",
+  TITLE = "title",
+  TAGS = "tags",
+  ENCRYPTED = "encrypted",
+  ENCRYPTION_METHOD = "encryptionMethod",
+  CHECKLIST_TYPE = "checklistType",
+  STATUSES = "statuses",
+  SHARED_WITH = "sharedWith",
+  OWNER = "owner",
+  CATEGORY = "category",
+  CREATED_AT = "createdAt",
+  UPDATED_AT = "updatedAt",
+}
+
+export enum BoardMetaKeys {
+  SPEC_NOTE = "specNote",
+}
+
+export const JOTTY_META_KEYS: string[] = Object.values(OwnedMetaKeys);
+
+export const LIST_META_KEYS: string[] = [
+  ...JOTTY_META_KEYS,
+  ...Object.values(BoardMetaKeys),
+];
+
+export const strayMeta = (
+  metadata: DocumentMetadata | undefined,
+  owned: string[] = JOTTY_META_KEYS,
+): Record<string, unknown> | undefined => {
+  if (!metadata) return undefined;
+
+  const strays = Object.entries(metadata).filter(
+    ([key]) => !owned.includes(key),
+  );
+
+  return strays.length > 0 ? Object.fromEntries(strays) : undefined;
+};
+
+export const keptMeta = (
+  stored: Record<string, unknown> | undefined,
+  incoming: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined => {
+  if (!stored && !incoming) return undefined;
+
+  return { ...(stored || {}), ...(incoming || {}) };
+};
+
 export const extractYamlMetadata = (
-  content: string
+  content: string,
 ): {
   metadata: DocumentMetadata;
   contentWithoutMetadata: string;
@@ -78,7 +136,7 @@ export const generateYamlFrontmatter = (metadata: DocumentMetadata): string => {
 export const updateYamlMetadata = (
   content: string,
   metadata: Partial<DocumentMetadata>,
-  preserveExisting: boolean = true
+  preserveExisting: boolean = true,
 ): string => {
   const { metadata: existingMetadata, contentWithoutMetadata } =
     extractYamlMetadata(content);
@@ -94,56 +152,35 @@ export const updateYamlMetadata = (
 
 export const extractTitle = (content: string, filename?: string): string => {
   const { metadata, contentWithoutMetadata } = extractYamlMetadata(content);
-
-  if (metadata.title) {
-    return metadata.title;
-  }
-
-  const lines = contentWithoutMetadata.split("\n");
-  const titleLine = lines.find((line) => line.startsWith("# "));
-  if (titleLine) {
-    return titleLine.replace(/^#\s*/, "").trim();
-  }
-
-  if (filename) {
-    return filename.replace(/-/g, " ");
-  }
-
-  return "Untitled";
+  return titleOf(metadata, contentWithoutMetadata, filename);
 };
 
-export const extractChecklistType = (content: string): "task" | "simple" => {
+export const extractChecklistType = (content: string): "kanban" | "simple" => {
   const { metadata, contentWithoutMetadata } = extractYamlMetadata(content);
 
   if (metadata.checklistType) {
-    return metadata.checklistType;
+    if (isKanbanType(metadata.checklistType)) {
+      return ChecklistsTypes.KANBAN;
+    }
+
+    return ChecklistsTypes.SIMPLE;
   }
 
   if (contentWithoutMetadata.includes("<!-- type:task -->")) {
-    return "task";
+    return ChecklistsTypes.KANBAN;
   }
 
-  return "simple";
+  return ChecklistsTypes.SIMPLE;
 };
 
-/**
- * Generates a new UUID
- * @returns UUID string
- */
 export const generateUuid = (): string => {
   return uuidv4();
 };
 
-/**
- * Migrates legacy title and checklist type to YAML metadata format
- * @param content - Original markdown content
- * @param generateNewUuid - Whether to generate a new UUID if none exists
- * @returns Updated content with YAML metadata
- */
 export const migrateToYamlMetadata = (
   content: string,
   generateNewUuid: boolean = true,
-  isChecklist: boolean = false
+  isChecklist: boolean = false,
 ): string => {
   const { metadata, contentWithoutMetadata } = extractYamlMetadata(content);
 
@@ -200,21 +237,18 @@ export const migrateToYamlMetadata = (
   return frontmatter + cleanedContent;
 };
 
-/**
- * Extracts UUID from YAML metadata in content
- * @param content - Markdown content
- * @returns UUID string or undefined
- */
+const FRONTMATTER_BLOCK = /^\uFEFF?---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/;
+
+export const splitFrontmatter = (raw: string): { prefix: string; body: string } => {
+  const prefix = raw.match(FRONTMATTER_BLOCK)?.[0] ?? "";
+  return { prefix, body: raw.slice(prefix.length) };
+};
+
 export const extractUuid = (content: string): string | undefined => {
   const { metadata } = extractYamlMetadata(content);
   return metadata.uuid;
 };
 
-/**
- * Checks if content has YAML metadata
- * @param content - Markdown content
- * @returns Boolean indicating if YAML metadata exists
- */
 export const hasYamlMetadata = (content: string): boolean => {
   return YAML_FRONTMATTER_REGEX.test(content);
 };

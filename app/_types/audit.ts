@@ -1,18 +1,23 @@
-export type AuditLogLevel = "DEBUG" | "INFO" | "WARNING" | "ERROR" | "CRITICAL";
+export const AUDIT_LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] as const;
 
-export type AuditCategory =
-  | "auth"
-  | "user"
-  | "checklist"
-  | "note"
-  | "sharing"
-  | "settings"
-  | "encryption"
-  | "api"
-  | "system"
-  | "file"
-  | "upload"
-  | "security";
+export type AuditLogLevel = (typeof AUDIT_LOG_LEVELS)[number];
+
+export const AUDIT_CATEGORIES = [
+  "auth",
+  "user",
+  "checklist",
+  "note",
+  "sharing",
+  "settings",
+  "encryption",
+  "api",
+  "system",
+  "file",
+  "upload",
+  "security",
+] as const;
+
+export type AuditCategory = (typeof AUDIT_CATEGORIES)[number];
 
 export type AuditAction =
   | "login"
@@ -45,6 +50,7 @@ export type AuditAction =
   | "settings_updated"
   | "app_settings_updated"
   | "user_settings_updated"
+  | "user_settings_rejected"
   | "theme_changed"
   | "custom_theme_saved"
   | "custom_emoji_saved"
@@ -76,7 +82,10 @@ export type AuditAction =
   | "mfa_verification_failed"
   | "mfa_backup_code_used"
   | "mfa_backup_code_failed"
-  | "mfa_backup_codes_regenerated";
+  | "mfa_backup_codes_regenerated"
+  | "legacy_lookup"
+  | "frontmatter_repaired"
+  | "frontmatter_edited";
 
 export interface AuditMetadata {
   [key: string]: any;

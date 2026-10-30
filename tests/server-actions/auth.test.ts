@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
   mockCookies,
   mockRedirect,
@@ -9,13 +9,12 @@ import {
   createFormData,
 } from '../setup'
 
-vi.mock('@/app/_server/actions/session', () => ({
+vi.mock('@/app/_server/actions/session/store', () => ({
   createSession: vi.fn().mockResolvedValue(undefined),
   readSessionData: vi.fn().mockResolvedValue({}),
   readSessions: vi.fn().mockResolvedValue({}),
   removeSession: vi.fn().mockResolvedValue(undefined),
-  writeSessionData: vi.fn().mockResolvedValue(undefined),
-  writeSessions: vi.fn().mockResolvedValue(undefined),
+  swapSession: vi.fn().mockResolvedValue(undefined),
 }))
 
 vi.mock('@/app/_server/actions/file', () => ({
@@ -33,14 +32,26 @@ vi.mock('@/app/_server/actions/users', () => ({
   getUsername: vi.fn().mockResolvedValue('testuser'),
 }))
 
+vi.mock('@/app/_server/actions/users/ensure-user', () => ({
+  ensureUser: vi.fn().mockResolvedValue(undefined),
+}))
+
+vi.mock('@/app/_server/actions/auth/ldap', () => ({
+  ldapLogin: vi.fn(),
+}))
+
 import { register, login, logout } from '@/app/_server/actions/auth'
 import { readJsonFile, writeJsonFile } from '@/app/_server/actions/file'
-import { readSessions, writeSessions } from '@/app/_server/actions/session'
+import { readSessions, createSession } from '@/app/_server/actions/session/store'
+import { ensureUser } from '@/app/_server/actions/users/ensure-user'
+import { ldapLogin } from '@/app/_server/actions/auth/ldap'
 
 const mockReadJsonFile = readJsonFile as ReturnType<typeof vi.fn>
 const mockWriteJsonFile = writeJsonFile as ReturnType<typeof vi.fn>
 const mockReadSessions = readSessions as ReturnType<typeof vi.fn>
-const mockWriteSessions = writeSessions as ReturnType<typeof vi.fn>
+const mockCreateSession = createSession as ReturnType<typeof vi.fn>
+const mockEnsureUser = ensureUser as ReturnType<typeof vi.fn>
+const mockLdapLogin = ldapLogin as ReturnType<typeof vi.fn>
 
 describe('Auth Actions', () => {
   beforeEach(() => {
@@ -77,7 +88,7 @@ describe('Auth Actions', () => {
       expect(result).toEqual({ error: 'Passwords do not match' })
     })
 
-    it('should return error when username already exists', async () => {
+    it('should reject registration when users already exist', async () => {
       mockReadJsonFile.mockResolvedValue([
         { username: 'testuser', passwordHash: 'hash', isAdmin: true },
       ])
@@ -90,7 +101,7 @@ describe('Auth Actions', () => {
 
       const result = await register(formData)
 
-      expect(result).toEqual({ error: 'Username already exists' })
+      expect(result).toEqual({ error: 'Registration is closed. Contact an administrator to create an account.' })
     })
 
     it('should create first user as admin and super admin', async () => {
@@ -121,11 +132,10 @@ describe('Auth Actions', () => {
       )
     })
 
-    it('should create subsequent users as non-admin', async () => {
+    it('should reject registration when users already exist (non-duplicate username)', async () => {
       mockReadJsonFile.mockResolvedValue([
         { username: 'existinguser', passwordHash: 'hash', isAdmin: true },
       ])
-      mockFs.mkdir.mockResolvedValue(undefined)
 
       const formData = createFormData({
         username: 'newuser',
@@ -133,21 +143,9 @@ describe('Auth Actions', () => {
         confirmPassword: 'password123',
       })
 
-      try {
-        await register(formData)
-      } catch (e: any) {
-        expect(e.message).toContain('REDIRECT:/')
-      }
+      const result = await register(formData)
 
-      expect(mockWriteJsonFile).toHaveBeenCalledWith(
-        expect.arrayContaining([
-          expect.objectContaining({
-            username: 'newuser',
-            isAdmin: false,
-          }),
-        ]),
-        expect.any(String)
-      )
+      expect(result).toEqual({ error: 'Registration is closed. Contact an administrator to create an account.' })
     })
 
     it('should set session cookie on successful registration', async () => {
@@ -239,6 +237,146 @@ describe('Auth Actions', () => {
 
       expect(mockLock).toHaveBeenCalled()
       expect(mockUnlock).toHaveBeenCalled()
+    })
+  })
+
+  describe('login() with AUTH_MODE=ldap', () => {
+    const ldapUser = {
+      username: 'alice',
+      passwordHash: '',
+      isAdmin: false,
+      failedLoginAttempts: 0,
+    }
+
+    beforeEach(() => {
+      process.env.AUTH_MODE = 'ldap'
+      process.env.DISABLE_BRUTEFORCE_PROTECTION = 'true'
+      mockReadJsonFile.mockResolvedValue([ldapUser])
+    })
+
+    afterEach(() => {
+      delete process.env.AUTH_MODE
+      delete process.env.DISABLE_BRUTEFORCE_PROTECTION
+    })
+
+    it('delegates to ldapLogin instead of checking the local password hash', async () => {
+      mockLdapLogin.mockResolvedValue({ ok: true, username: 'alice', isAdmin: false })
+
+      const formData = createFormData({ username: 'alice', password: 'secret' })
+      try { await login(formData) } catch {}
+
+      expect(mockLdapLogin).toHaveBeenCalledWith('alice', 'secret')
+    })
+
+    it('returns an error and does NOT call createSession on invalid_credentials', async () => {
+      mockLdapLogin.mockResolvedValue({ ok: false, kind: 'invalid_credentials' })
+
+      const formData = createFormData({ username: 'alice', password: 'wrong' })
+      const result = await login(formData)
+
+      expect(result).toMatchObject({ error: 'Invalid username or password' })
+      expect(mockCreateSession).not.toHaveBeenCalled()
+    })
+
+    it('increments the brute-force counter on invalid_credentials when user exists', async () => {
+      delete process.env.DISABLE_BRUTEFORCE_PROTECTION
+      mockLdapLogin.mockResolvedValue({ ok: false, kind: 'invalid_credentials' })
+      mockReadJsonFile.mockResolvedValue([{ ...ldapUser, failedLoginAttempts: 0 }])
+
+      const formData = createFormData({ username: 'alice', password: 'wrong' })
+      await login(formData)
+
+      expect(mockWriteJsonFile).toHaveBeenCalledWith(
+        expect.arrayContaining([
+          expect.objectContaining({ failedLoginAttempts: 1 }),
+        ]),
+        expect.any(String)
+      )
+    })
+
+    it('returns a generic error and does NOT increment the brute-force counter on connection_error', async () => {
+      delete process.env.DISABLE_BRUTEFORCE_PROTECTION
+      mockLdapLogin.mockResolvedValue({ ok: false, kind: 'connection_error' })
+
+      const formData = createFormData({ username: 'alice', password: 'secret' })
+      const result = await login(formData)
+
+      expect(result).toMatchObject({ error: 'Authentication service unavailable' })
+      expect(mockWriteJsonFile).not.toHaveBeenCalled()
+    })
+
+    it('redirects to /auth/login?error=unauthorized on unauthorized result', async () => {
+      mockLdapLogin.mockResolvedValue({ ok: false, kind: 'unauthorized' })
+
+      const formData = createFormData({ username: 'alice', password: 'secret' })
+      try {
+        await login(formData)
+      } catch (e: any) {
+        expect(e.message).toContain('REDIRECT:/auth/login?error=unauthorized')
+      }
+    })
+
+    it('calls ensureUser with the username and isAdmin flag on success', async () => {
+      mockLdapLogin.mockResolvedValue({ ok: true, username: 'alice', isAdmin: true })
+
+      const formData = createFormData({ username: 'alice', password: 'secret' })
+      try { await login(formData) } catch {}
+
+      expect(mockEnsureUser).toHaveBeenCalledWith('alice', true)
+    })
+
+    it('calls createSession with loginType "ldap" on success', async () => {
+      mockLdapLogin.mockResolvedValue({ ok: true, username: 'alice', isAdmin: false })
+
+      const formData = createFormData({ username: 'alice', password: 'secret' })
+      try { await login(formData) } catch {}
+
+      expect(mockCreateSession).toHaveBeenCalledWith(
+        expect.any(String),
+        'alice',
+        'ldap',
+        expect.any(Boolean)
+      )
+    })
+
+    it('sets the session cookie on success', async () => {
+      mockLdapLogin.mockResolvedValue({ ok: true, username: 'alice', isAdmin: false })
+
+      const formData = createFormData({ username: 'alice', password: 'secret' })
+      try { await login(formData) } catch {}
+
+      expect(mockCookies.set).toHaveBeenCalledWith(
+        'session',
+        expect.any(String),
+        expect.objectContaining({ httpOnly: true, path: '/' })
+      )
+    })
+
+    it('redirects to / on success', async () => {
+      mockLdapLogin.mockResolvedValue({ ok: true, username: 'alice', isAdmin: false })
+
+      const formData = createFormData({ username: 'alice', password: 'secret' })
+      try {
+        await login(formData)
+      } catch (e: any) {
+        expect(e.message).toContain('REDIRECT:/')
+      }
+    })
+
+    it('still applies the brute-force lockout check before contacting LDAP', async () => {
+      delete process.env.DISABLE_BRUTEFORCE_PROTECTION
+      const lockedUser = {
+        ...ldapUser,
+        failedLoginAttempts: 10,
+        nextAllowedLoginAttempt: new Date(Date.now() + 60_000).toISOString(),
+      }
+      mockReadJsonFile.mockResolvedValue([lockedUser])
+
+      const formData = createFormData({ username: 'alice', password: 'secret' })
+      const result = await login(formData)
+
+      expect(result).toMatchObject({ error: 'Too many failed attempts' })
+      expect(mockLdapLogin).not.toHaveBeenCalled()
     })
   })
 

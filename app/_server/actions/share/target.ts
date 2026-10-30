@@ -1,0 +1,232 @@
+import path from "path";
+import fs from "fs/promises";
+import { getTranslations } from "next-intl/server";
+import { Modes, PermissionTypes } from "@/app/_types/enums";
+import { SharingPermissions } from "@/app/_types/core";
+import { SharedMount } from "@/app/_types/sharing";
+import { UNCATEGORIZED } from "@/app/_consts/notes";
+import { isPathSafe } from "@/app/_utils/path-utils";
+import { granted } from "@/app/_utils/sharing-utils";
+import { mountsFor, userDirFor } from "./mounts";
+
+export interface TargetLocation {
+  dir: string;
+  owner: string;
+  category: string;
+  isMount: boolean;
+  isImplicit: boolean;
+  permissions?: SharingPermissions;
+  mount?: SharedMount;
+}
+
+const _inside = (base: string, category: string): boolean =>
+  !category || isPathSafe(base, category);
+
+const _plainSegments = (relative: string): boolean =>
+  !/[\\\0]/.test(relative) &&
+  relative
+    .split("/")
+    .every((segment) => segment !== "" && segment !== "." && segment !== "..");
+
+const _matches = (mount: SharedMount, category: string): boolean =>
+  category === mount.displayName ||
+  category.startsWith(`${mount.displayName}/`);
+
+const _isOwned = async (
+  mode: Modes,
+  username: string,
+  category: string,
+): Promise<boolean> => {
+  const root = category.split("/")[0];
+
+  try {
+    const stats = await fs.stat(
+      path.join(process.cwd(), userDirFor(mode, username), root),
+    );
+    return stats.isDirectory();
+  } catch {
+    return false;
+  }
+};
+
+export const targetDir = async (
+  mode: Modes,
+  username: string,
+  category: string,
+): Promise<TargetLocation> => {
+  const home = path.join(process.cwd(), userDirFor(mode, username));
+  const reachable = _inside(home, category);
+
+  const own: TargetLocation = {
+    dir: reachable ? path.join(home, category) : home,
+    owner: username,
+    category: reachable ? category : "",
+    isMount: false,
+    isImplicit: false,
+  };
+
+  if (!category || !reachable) return own;
+  if (await _isOwned(mode, username, category)) return own;
+
+  const mounts = await mountsFor(mode, username);
+  const mount = mounts.find((candidate) => _matches(candidate, category));
+
+  if (!mount) return own;
+
+  const relative = category.slice(mount.displayName.length).replace(/^\//, "");
+  const stranded: TargetLocation = { ...own, dir: home, category: "" };
+
+  if (relative && !_plainSegments(relative)) return stranded;
+
+  const owned = mount.isImplicit
+    ? ""
+    : [mount.categoryPath, relative].filter(Boolean).join("/");
+
+  const lodgings = path.join(process.cwd(), userDirFor(mode, mount.owner));
+  const sharedRoot = mount.isImplicit
+    ? lodgings
+    : path.join(lodgings, mount.categoryPath);
+
+  if (!_inside(lodgings, owned)) return stranded;
+  if (!mount.isImplicit && !isPathSafe(sharedRoot, path.join(lodgings, owned))) {
+    return stranded;
+  }
+
+  return {
+    dir: path.join(lodgings, owned),
+    owner: mount.owner,
+    category: owned,
+    isMount: true,
+    isImplicit: mount.isImplicit,
+    permissions: mount.permissions,
+    mount,
+  };
+};
+
+interface Locatable {
+  owner?: string;
+  category?: string;
+  id?: string;
+}
+
+export interface Place {
+  owner: string;
+  category: string;
+}
+
+export interface MovePlan {
+  home: Place;
+  destination: Place;
+  target: TargetLocation;
+  isMoving: boolean;
+}
+
+const _samePlace = (a: string, b: string): boolean =>
+  (a || UNCATEGORIZED) === (b || UNCATEGORIZED);
+
+export const movePlan = async (
+  mode: Modes,
+  username: string,
+  item: Locatable,
+  requested: string,
+): Promise<MovePlan> => {
+  const home: Place = {
+    owner: item.owner || username,
+    category: item.category || "",
+  };
+
+  const target = await targetDir(mode, username, requested);
+  const shown = await shownAs(mode, username, home.owner, home.category);
+
+  if (_samePlace(requested, shown)) {
+    return { home, target, destination: home, isMoving: false };
+  }
+
+  const anchored = target.isImplicit && target.owner === home.owner;
+
+  const destination: Place = anchored
+    ? home
+    : { owner: target.owner, category: target.category };
+
+  return {
+    home,
+    target,
+    destination,
+    isMoving:
+      destination.owner !== home.owner ||
+      destination.category !== home.category,
+  };
+};
+
+export const diskPath = async (
+  mode: Modes,
+  username: string,
+  item: Locatable,
+): Promise<string> => {
+  const target = await targetDir(mode, username, item.category || "");
+  const owner = item.owner || target.owner;
+
+  return path.join(
+    process.cwd(),
+    userDirFor(mode, owner),
+    target.category || UNCATEGORIZED,
+    `${item.id}.md`,
+  );
+};
+
+export const shownAs = async (
+  mode: Modes,
+  username: string,
+  owner: string,
+  category: string,
+): Promise<string> => {
+  if (owner === username) return category;
+
+  const mounts = await mountsFor(mode, username);
+  const mount = mounts.find(
+    (candidate) =>
+      candidate.owner === owner &&
+      !candidate.isImplicit &&
+      (category === candidate.categoryPath ||
+        category.startsWith(`${candidate.categoryPath}/`)),
+  );
+
+  if (!mount) return category;
+
+  const relative = category.slice(mount.categoryPath.length).replace(/^\//, "");
+
+  return relative ? `${mount.displayName}/${relative}` : mount.displayName;
+};
+
+export const refusalMessage = async (): Promise<string> => {
+  const t = await getTranslations("errors");
+  return t("requiredPermissions");
+};
+
+export const reservedRefusal = async (category: string): Promise<string> => {
+  console.warn("Refusing a reserved folder name:", category);
+  const t = await getTranslations("errors");
+  return t("categoryReserved");
+};
+
+export const bouncer = async (
+  target: TargetLocation,
+  username: string,
+  permission: PermissionTypes,
+): Promise<{ allowed: boolean; error?: string }> => {
+  if (target.owner === username) return { allowed: true };
+
+  if (target.isImplicit) {
+    return {
+      allowed: false,
+      error: await refusalMessage(),
+    };
+  }
+
+  return granted(target.permissions, permission)
+    ? { allowed: true }
+    : {
+        allowed: false,
+        error: await refusalMessage(),
+      };
+};

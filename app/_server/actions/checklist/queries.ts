@@ -1,25 +1,41 @@
-"use server";
-
 import path from "path";
 import fs from "fs/promises";
 import { Checklist, User, GetChecklistsOptions } from "@/app/_types";
 import { CHECKLISTS_FOLDER } from "@/app/_consts/checklists";
+import { UNCATEGORIZED } from "@/app/_consts/notes";
 import { USERS_FILE } from "@/app/_consts/files";
-import { Modes } from "@/app/_types/enums";
+import { Modes, PermissionTypes } from "@/app/_types/enums";
 import { getCurrentUser } from "@/app/_server/actions/users";
-import { getUserModeDir, ensureDir } from "@/app/_server/actions/file";
+import { getUserModeDir, ensureDir, serverReadExisting } from "@/app/_server/actions/file";
+import { uuidOf } from "@/app/_server/actions/lib/read-only";
+import { lockOf } from "@/app/_server/actions/lib/unstamped";
 import { readJsonFile } from "@/app/_server/actions/file";
 import { parseChecklistContent } from "@/app/_utils/client-parser-utils";
 import {
+  createdAtOf,
   extractChecklistType,
-  generateUuid,
+  extractYamlMetadata,
   toIso,
-  updateYamlMetadata,
 } from "@/app/_utils/yaml-metadata-utils";
-import { readListsRecursively, type ChecklistReadResult } from "./readers";
+import {
+  patchListListing,
+  readListsRecursively,
+  type ChecklistReadResult,
+  type ListReadOptions,
+} from "./readers";
+import { mountsFor, mountedItems } from "@/app/_server/actions/share/mounts";
+import { canReachFile } from "@/app/_server/actions/share/access";
 import { checkAndRefreshRecurringItems } from "./parsers";
+import { countItems } from "@/app/_utils/checklist-count-utils";
+import { summarizeList } from "@/app/_utils/browse/list-summary-utils";
 import { isDebugFlag } from "@/app/_utils/env-utils";
-import { getOrCompute, metaCacheKey } from "@/app/_server/lib/metadata-cache";
+import {
+  getOrCompute,
+  metaCacheKey,
+  summaryCacheKey,
+} from "@/app/_server/actions/lib/metadata-cache";
+import { dropClashes } from "@/app/_server/actions/lib/uuid-keeper";
+import { pinsFirst } from "@/app/_utils/pin-utils";
 
 export const getUserChecklists = async (options: GetChecklistsOptions = {}) => {
   const {
@@ -33,6 +49,8 @@ export const getUserChecklists = async (options: GetChecklistsOptions = {}) => {
     offset,
     pinnedPaths,
     preserveOrder = false,
+    countOpenItems = false,
+    summarize = false,
   } = options;
 
   try {
@@ -54,35 +72,34 @@ export const getUserChecklists = async (options: GetChecklistsOptions = {}) => {
     const layoutTiming = metadataOnly;
     const t1 = layoutTiming ? performance.now() : 0;
 
-    const canCache = metadataOnly && !allowArchived && !isRaw;
+    const isSummary = summarize && !metadataOnly && !isRaw;
+    const canCache = (metadataOnly || isSummary) && !allowArchived && !isRaw;
+    const cacheKeyOf = isSummary ? summaryCacheKey : metaCacheKey;
     const absUserDir = path.isAbsolute(userDir)
       ? userDir
       : path.join(process.cwd(), userDir);
-    const ownCacheKey = canCache ? metaCacheKey("lists", absUserDir) : null;
+    const ownCacheKey = canCache
+      ? cacheKeyOf(Modes.CHECKLISTS, absUserDir)
+      : null;
 
-    let lists: ChecklistReadResult[] = ownCacheKey
-      ? await getOrCompute(ownCacheKey, absUserDir, () =>
-          readListsRecursively(
-            userDir,
-            "",
-            currentUser.username,
-            allowArchived,
-            isRaw,
-            metadataOnly,
-            undefined,
-            undefined,
-          ),
+    const readOptions: ListReadOptions = {
+      allowArchived,
+      isRaw,
+      metadataOnly,
+      summarize: isSummary,
+    };
+    const readOwn = () => readListsRecursively(userDir, currentUser.username, readOptions);
+
+    const cached: ChecklistReadResult[] = ownCacheKey
+      ? await getOrCompute(
+          ownCacheKey,
+          absUserDir,
+          readOwn,
+          patchListListing(absUserDir, currentUser.username, readOptions),
         )
-      : await readListsRecursively(
-          userDir,
-          "",
-          currentUser.username,
-          allowArchived,
-          isRaw,
-          metadataOnly,
-          undefined,
-          undefined,
-        );
+      : await readOwn();
+
+    let lists: ChecklistReadResult[] = dropClashes(cached, absUserDir);
 
     if (layoutTiming && isDebugFlag("crud")) {
       console.warn(
@@ -91,65 +108,48 @@ export const getUserChecklists = async (options: GetChecklistsOptions = {}) => {
     }
 
     const t2 = layoutTiming ? performance.now() : 0;
-    const { getAllSharedItemsForUser } =
-      await import("@/app/_server/actions/sharing");
-    const sharedData = await getAllSharedItemsForUser(currentUser.username);
+    const mounts = await mountsFor(Modes.CHECKLISTS, currentUser.username);
     if (layoutTiming && isDebugFlag("crud")) {
       console.warn(
-        `[layout checklists] sharedItems: ${(performance.now() - t2).toFixed(0)}ms`,
+        `[layout checklists] mounts: ${(performance.now() - t2).toFixed(0)}ms`,
       );
     }
 
-    for (const sharedItem of sharedData.checklists) {
+    for (const mount of mounts) {
       try {
-        const itemIdentifier = sharedItem.uuid || sharedItem.id;
-        if (!itemIdentifier) continue;
-
-        const sharerDir = path.join(
+        const ownerDir = path.join(
           process.cwd(),
           "data",
           CHECKLISTS_FOLDER,
-          sharedItem.sharer,
+          mount.owner,
         );
-        await ensureDir(sharerDir);
+        await ensureDir(ownerDir);
 
-        const sharerCacheKey = canCache
-          ? metaCacheKey("lists", sharerDir)
+        const ownerCacheKey = canCache
+          ? cacheKeyOf(Modes.CHECKLISTS, ownerDir)
           : null;
 
-        const sharerLists = sharerCacheKey
-          ? await getOrCompute(sharerCacheKey, sharerDir, () =>
-              readListsRecursively(
-                sharerDir,
-                "",
-                sharedItem.sharer,
-                allowArchived,
-                isRaw,
-                metadataOnly,
-              ),
+        const readOwner = () => readListsRecursively(ownerDir, mount.owner, readOptions);
+        const ownerLists = ownerCacheKey
+          ? await getOrCompute(
+              ownerCacheKey,
+              ownerDir,
+              readOwner,
+              patchListListing(ownerDir, mount.owner, readOptions),
             )
-          : await readListsRecursively(
-              sharerDir,
-              "",
-              sharedItem.sharer,
-              allowArchived,
-              isRaw,
-              metadataOnly,
-            );
+          : await readOwner();
 
-        const sharedChecklist = sharerLists.find(
-          (list) => list.uuid === itemIdentifier || list.id === itemIdentifier,
+        const shared = await mountedItems(
+          Modes.CHECKLISTS,
+          currentUser.username,
+          mount,
+          ownerLists,
         );
 
-        if (sharedChecklist) {
-          lists.push({
-            ...sharedChecklist,
-            isShared: true,
-          });
-        }
+        lists.push(...shared);
       } catch (error) {
         console.error(
-          `Error reading shared checklist ${sharedItem.uuid || sharedItem.id}:`,
+          `Error reading shared checklists from ${mount.owner}:`,
           error,
         );
         continue;
@@ -159,7 +159,7 @@ export const getUserChecklists = async (options: GetChecklistsOptions = {}) => {
     if (filter) {
       if (filter.type === "category") {
         lists = lists.filter((list: any) => {
-          const listCategory = list.category || "Uncategorized";
+          const listCategory = list.category || UNCATEGORIZED;
           return (
             listCategory === filter.value ||
             listCategory.startsWith(filter.value + "/")
@@ -183,6 +183,14 @@ export const getUserChecklists = async (options: GetChecklistsOptions = {}) => {
       );
     }
 
+    const openItems = countOpenItems
+      ? lists.reduce((open, list) => {
+          const { total, completed } =
+            list.summary || countItems(list.items || [], list.type);
+          return open + total - completed;
+        }, 0)
+      : undefined;
+
     const limitNum = typeof limit === "number" && limit > 0 ? limit : undefined;
     const offsetNum = typeof offset === "number" && offset >= 0 ? offset : 0;
 
@@ -192,20 +200,7 @@ export const getUserChecklists = async (options: GetChecklistsOptions = {}) => {
       pinnedPaths.length > 0 &&
       limitNum !== undefined
     ) {
-      const pathMatches = (list: ChecklistReadResult, p: string) => {
-        const c = list.category || "Uncategorized";
-        const u = (list as { uuid?: string }).uuid || list.id;
-        return `${c}/${u}` === p || `${c}/${list.id}` === p;
-      };
-      const pinned: ChecklistReadResult[] = [];
-      for (const p of pinnedPaths) {
-        const found = lists.find((l) => pathMatches(l, p));
-        if (found) pinned.push(found);
-      }
-      const rest = lists.filter(
-        (l) => !pinnedPaths.some((p) => pathMatches(l, p)),
-      );
-      lists = [...pinned, ...rest].slice(0, limitNum);
+      lists = pinsFirst(lists, pinnedPaths, limitNum);
     } else if (limitNum !== undefined) {
       lists = lists.slice(offsetNum, offsetNum + limitNum);
     } else if (offsetNum > 0) {
@@ -235,7 +230,9 @@ export const getUserChecklists = async (options: GetChecklistsOptions = {}) => {
           const { checklist } = await checkAndRefreshRecurringItems(
             list as Checklist,
           );
-          return checklist;
+          return isSummary && !checklist.summary
+            ? { ...checklist, items: [], summary: summarizeList(checklist) }
+            : checklist;
         }),
       );
     }
@@ -247,7 +244,11 @@ export const getUserChecklists = async (options: GetChecklistsOptions = {}) => {
         : undefined,
     }));
 
-    return { success: true, data: serializedLists as Checklist[] };
+    return {
+      success: true,
+      data: serializedLists as Checklist[],
+      ...(openItems !== undefined && { openItems }),
+    };
   } catch (error) {
     console.error("Error in getUserChecklists:", error);
     return { success: false, error: "Failed to fetch lists" };
@@ -255,23 +256,19 @@ export const getUserChecklists = async (options: GetChecklistsOptions = {}) => {
 };
 
 export const getListById = async (
-  id: string,
+  uuid: string,
   username?: string,
-  category?: string,
-  unarchive?: boolean,
 ): Promise<Checklist | undefined> => {
   const { grepFindFileByUuid } = await import("@/app/_utils/grep-utils");
-  const { serverReadFile } = await import("@/app/_server/actions/file");
 
   if (!username) {
     const { getUserByChecklistUuid } =
       await import("@/app/_server/actions/users");
-    const userByUuid = await getUserByChecklistUuid(id);
-    if (userByUuid.success && userByUuid.data) {
-      username = userByUuid.data.username;
-    } else {
+    const userByUuid = await getUserByChecklistUuid(uuid);
+    if (!userByUuid.success || !userByUuid.data) {
       return undefined;
     }
+    username = userByUuid.data.username;
   }
 
   let ownerUsername = username;
@@ -282,79 +279,47 @@ export const getListById = async (
     username,
   );
   let filePath: string | null = null;
-  let listId = id;
-  let listCategory = category || "Uncategorized";
-  const isUuid =
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
+  let listId = uuid;
+  let listCategory = UNCATEGORIZED;
 
-  if (isUuid) {
-    const found = await grepFindFileByUuid(absUserDir, id);
-    if (found) {
-      filePath = found.filePath;
-      listId = found.id;
-      listCategory = found.category;
-    }
-  }
-
-  if (!filePath && category) {
-    const directPath = path.join(absUserDir, category, `${id}.md`);
-    try {
-      await fs.access(directPath);
-      filePath = directPath;
-    } catch {
-      if (unarchive) {
-        const archivedPath = path.join(
-          absUserDir,
-          ".archive",
-          category,
-          `${id}.md`,
-        );
-        try {
-          await fs.access(archivedPath);
-          filePath = archivedPath;
-          listCategory = `.archive/${category}`;
-        } catch {}
-      }
-    }
+  const found = await grepFindFileByUuid(absUserDir, uuid);
+  if (found) {
+    filePath = found.filePath;
+    listId = found.id;
+    listCategory = found.category || UNCATEGORIZED;
   }
 
   let isShared = false;
 
   if (!filePath) {
-    const { getAllSharedItemsForUser } =
-      await import("@/app/_server/actions/sharing");
-    const sharedData = await getAllSharedItemsForUser(username);
-    for (const sharedItem of sharedData.checklists) {
-      const itemIdentifier = sharedItem.uuid || sharedItem.id;
-      if (!itemIdentifier) continue;
+    const mounts = await mountsFor(Modes.CHECKLISTS, username);
 
-      const sharerDir = path.join(
+    for (const mount of mounts) {
+      const ownerDir = path.join(
         process.cwd(),
         "data",
         CHECKLISTS_FOLDER,
-        sharedItem.sharer,
+        mount.owner,
       );
-      const found = isUuid && (await grepFindFileByUuid(sharerDir, id));
+      const sharedFound = await grepFindFileByUuid(ownerDir, uuid);
 
-      if (found) {
-        filePath = found.filePath;
-        listId = found.id;
-        listCategory = found.category;
-        isShared = true;
-        ownerUsername = sharedItem.sharer;
-        break;
-      }
+      if (!sharedFound) continue;
 
-      if (!isUuid && category) {
-        const sharedPath = path.join(sharerDir, category, `${id}.md`);
-        try {
-          await fs.access(sharedPath);
-          filePath = sharedPath;
-          isShared = true;
-          ownerUsername = sharedItem.sharer;
-          break;
-        } catch {}
-      }
+      const allowed = await canReachFile(
+        Modes.CHECKLISTS,
+        sharedFound.filePath,
+        username,
+        PermissionTypes.READ,
+      );
+
+      if (!allowed) continue;
+
+      filePath = sharedFound.filePath;
+      listId = sharedFound.id;
+      listCategory = sharedFound.category || UNCATEGORIZED;
+      isShared = true;
+      ownerUsername = mount.owner;
+      break;
     }
   }
 
@@ -362,40 +327,35 @@ export const getListById = async (
     return undefined;
   }
 
-  const rawContent = await serverReadFile(filePath);
-  if (!rawContent) return undefined;
+  const rawContent = await serverReadExisting(filePath);
+  if (rawContent === null) return undefined;
+  const lockReason = await lockOf(filePath).catch(() => null);
 
   const stats = await fs.stat(filePath);
   const parsedData = parseChecklistContent(rawContent, listId);
   const checklistType = extractChecklistType(rawContent) || "task";
 
-  let finalUuid = parsedData.uuid;
-  if (!finalUuid) {
-    finalUuid = generateUuid();
-    try {
-      const updatedContent = updateYamlMetadata(rawContent, {
-        uuid: finalUuid,
-        title: parsedData.title || listId.replace(/-/g, " "),
-        checklistType: checklistType,
-      });
-      await fs.writeFile(filePath, updatedContent, "utf-8");
-    } catch (error) {
-      console.warn("Failed to save UUID to checklist file:", error);
-    }
-  }
-
   return {
     id: listId,
-    uuid: finalUuid,
+    uuid: uuidOf(parsedData.uuid) || uuid,
+    ...(lockReason && { lockReason }),
     title: parsedData.title,
     type: checklistType as Checklist["type"],
     items: parsedData.items,
     category: listCategory,
-    createdAt: toIso(stats.birthtime),
+    createdAt: createdAtOf(extractYamlMetadata(rawContent).metadata, stats.birthtime),
     updatedAt: toIso(stats.mtime),
     owner: ownerUsername,
     isShared,
     ...(parsedData.statuses && { statuses: parsedData.statuses }),
+    ...(parsedData.tags && { tags: parsedData.tags }),
+    ...(parsedData.sharedWith !== undefined && {
+      sharedWith: parsedData.sharedWith,
+    }),
+    ...(parsedData.specNote && { specNote: parsedData.specNote }),
+    ...(parsedData.extraMetadata && {
+      extraMetadata: parsedData.extraMetadata,
+    }),
   };
 };
 
@@ -417,13 +377,10 @@ export const getAllLists = async (
       );
 
       try {
-        const userLists = await readListsRecursively(
-          userDir,
-          "",
-          user.username,
+        const userLists = await readListsRecursively(userDir, user.username, {
           allowArchived,
           isRaw,
-        );
+        });
         allLists.push(...(userLists as Checklist[]));
       } catch (error) {
         continue;
@@ -435,16 +392,4 @@ export const getAllLists = async (
     console.error("Error in getAllLists:", error);
     return { success: false, error: "Failed to fetch all lists" };
   }
-};
-
-export const getChecklistsForDisplay = async (
-  filter?: { type: "category" | "tag"; value: string } | null,
-  limit: number = 20,
-  offset: number = 0,
-) => {
-  return getUserChecklists({
-    filter: filter || undefined,
-    limit,
-    offset: filter ? offset : undefined,
-  });
 };

@@ -1,11 +1,13 @@
 "use client";
 
 import { useEffect, useRef, useCallback, RefObject } from "react";
+import { eatsSwipe } from "@/app/_utils/gesture-utils";
 
 interface UseSwipeNavigationProps {
   enabled: boolean;
   onNavigateLeft: () => void;
   onNavigateRight: () => void;
+  onSwipingChange?: (swiping: boolean) => void;
   wrapperRef: RefObject<HTMLDivElement | null>;
   currentRef: RefObject<HTMLDivElement | null>;
   prevRef: RefObject<HTMLDivElement | null>;
@@ -31,7 +33,7 @@ const INCOMING_START_SCALE = 0.88;
 const ALL_TRANSITION = `transform ${SNAP_DURATION}ms ${SNAP_EASING}, opacity ${SNAP_DURATION}ms ease-out`;
 const COMPLETE_TRANSITION = `transform ${COMPLETE_DURATION}ms ${COMPLETE_EASING}, opacity ${COMPLETE_DURATION}ms ${COMPLETE_EASING}`;
 
-const applyStyles = (
+const _applyStyles = (
   el: HTMLElement | null,
   transform: string,
   opacity: number,
@@ -43,10 +45,23 @@ const applyStyles = (
   el.style.opacity = String(opacity);
 };
 
+const _clearStyles = (el: HTMLElement | null) => {
+  if (!el) return;
+  el.style.transition = "";
+  el.style.transform = "";
+  el.style.opacity = "";
+};
+
+const _setWillChange = (el: HTMLElement | null, active: boolean) => {
+  if (!el) return;
+  el.style.willChange = active ? "transform, opacity" : "";
+};
+
 export const useSwipeNavigation = ({
   enabled,
   onNavigateLeft,
   onNavigateRight,
+  onSwipingChange,
   wrapperRef,
   currentRef,
   prevRef,
@@ -54,7 +69,14 @@ export const useSwipeNavigation = ({
   hasPrev,
   hasNext,
 }: UseSwipeNavigationProps) => {
+  const _setOverlaysVisible = (visible: boolean) => {
+    const display = visible ? "" : "none";
+    if (prevRef.current) prevRef.current.style.display = display;
+    if (nextRef.current) nextRef.current.style.display = display;
+  };
+
   const touchStartRef = useRef<{ x: number; y: number; time: number } | null>(null);
+  const touchTargetRef = useRef<EventTarget | null>(null);
   const directionLockedRef = useRef<"horizontal" | "vertical" | null>(null);
   const navigatingRef = useRef(false);
   const swipingRef = useRef(false);
@@ -73,10 +95,26 @@ export const useSwipeNavigation = ({
 
   const resetAll = useCallback((transition: string | null) => {
     const sw = window.innerWidth;
-    applyStyles(currentRef.current, "translateX(0)", 1, transition);
-    applyStyles(prevRef.current, `translateX(-${sw}px) scale(${INCOMING_START_SCALE})`, 0, transition);
-    applyStyles(nextRef.current, `translateX(${sw}px) scale(${INCOMING_START_SCALE})`, 0, transition);
+    _applyStyles(prevRef.current, `translateX(-${sw}px) scale(${INCOMING_START_SCALE})`, 0, transition);
+    _applyStyles(nextRef.current, `translateX(${sw}px) scale(${INCOMING_START_SCALE})`, 0, transition);
+
+    const wasSwiping = swipingRef.current;
     swipingRef.current = false;
+
+    const finalize = () => {
+      _clearStyles(currentRef.current);
+      _setWillChange(currentRef.current, false);
+      _setWillChange(prevRef.current, false);
+      _setWillChange(nextRef.current, false);
+      _setOverlaysVisible(false);
+    };
+
+    if (transition && wasSwiping) {
+      _applyStyles(currentRef.current, "translateX(0)", 1, transition);
+      setTimeout(finalize, SNAP_DURATION);
+    } else {
+      finalize();
+    }
   }, [currentRef, prevRef, nextRef]);
 
   const applyProgress = useCallback((
@@ -92,14 +130,14 @@ export const useSwipeNavigation = ({
       : p * CURRENT_PARALLAX * sw;
     const currentOpacity = 1 - p * (1 - CURRENT_FADE_TO);
     const currentScale = 1 - p * (1 - CURRENT_SHRINK_TO);
-    applyStyles(currentRef.current, `translateX(${currentShift}px) scale(${currentScale})`, currentOpacity, transition);
+    _applyStyles(currentRef.current, `translateX(${currentShift}px) scale(${currentScale})`, currentOpacity, transition);
 
     const incomingRef = direction === "left" ? nextRef : prevRef;
     const incomingX = direction === "left"
       ? (1 - p) * sw
       : -(1 - p) * sw;
     const incomingScale = INCOMING_START_SCALE + p * (1 - INCOMING_START_SCALE);
-    applyStyles(incomingRef.current, `translateX(${incomingX}px) scale(${incomingScale})`, 1, transition);
+    _applyStyles(incomingRef.current, `translateX(${incomingX}px) scale(${incomingScale})`, 1, transition);
   }, [currentRef, prevRef, nextRef]);
 
   const handleTouchStart = useCallback((e: TouchEvent) => {
@@ -111,6 +149,7 @@ export const useSwipeNavigation = ({
       y: e.touches[0].clientY,
       time: Date.now(),
     };
+    touchTargetRef.current = e.target;
     directionLockedRef.current = null;
     swipingRef.current = false;
   }, []);
@@ -131,8 +170,19 @@ export const useSwipeNavigation = ({
         touchStartRef.current = null;
         return;
       }
+
+      if (eatsSwipe(touchTargetRef.current, deltaX, wrapperRef.current)) {
+        directionLockedRef.current = "vertical";
+        touchStartRef.current = null;
+        return;
+      }
+
       directionLockedRef.current = "horizontal";
       swipingRef.current = true;
+      _setOverlaysVisible(true);
+      _setWillChange(currentRef.current, true);
+      _setWillChange(prevRef.current, true);
+      _setWillChange(nextRef.current, true);
     }
 
     if (directionLockedRef.current !== "horizontal") return;
@@ -151,12 +201,12 @@ export const useSwipeNavigation = ({
     rafRef.current = requestAnimationFrame(() => {
       if (!hasTarget) {
         const resistedShift = swipingLeft ? -effectiveDelta * 0.5 : effectiveDelta * 0.5;
-        applyStyles(currentRef.current, `translateX(${resistedShift}px)`, 1, null);
+        _applyStyles(currentRef.current, `translateX(${resistedShift}px)`, 1, null);
       } else {
         applyProgress(progress, direction, null);
       }
     });
-  }, [applyProgress, currentRef]);
+  }, [applyProgress, currentRef, wrapperRef]);
 
   const finishTouch = useCallback((deltaX: number, deltaTime: number) => {
     const velocity = Math.abs(deltaX) / deltaTime;
@@ -193,12 +243,14 @@ export const useSwipeNavigation = ({
     if (!touchStartRef.current || !enabledRef.current || navigatingRef.current) {
       if (swipingRef.current) resetAll(ALL_TRANSITION);
       touchStartRef.current = null;
+      touchTargetRef.current = null;
       directionLockedRef.current = null;
       return;
     }
 
     if (!swipingRef.current) {
       touchStartRef.current = null;
+      touchTargetRef.current = null;
       directionLockedRef.current = null;
       return;
     }
@@ -208,6 +260,7 @@ export const useSwipeNavigation = ({
     const deltaTime = Math.max(Date.now() - touchStartRef.current.time, 1);
 
     touchStartRef.current = null;
+    touchTargetRef.current = null;
     directionLockedRef.current = null;
     finishTouch(deltaX, deltaTime);
   }, [finishTouch, resetAll]);
@@ -218,6 +271,7 @@ export const useSwipeNavigation = ({
       rafRef.current = null;
     }
     touchStartRef.current = null;
+    touchTargetRef.current = null;
     directionLockedRef.current = null;
     if (swipingRef.current) resetAll(ALL_TRANSITION);
   }, [resetAll]);

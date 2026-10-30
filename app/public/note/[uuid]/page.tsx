@@ -1,0 +1,93 @@
+import { redirect, permanentRedirect } from "next/navigation";
+import { getNoteById } from "@/app/_server/actions/note/queries";
+import { isUuid } from "@/app/_consts/identity";
+import { PublicNoteView } from "@/app/_components/FeatureComponents/PublicView/PublicNoteView";
+import { getCurrentUser } from "@/app/_server/actions/users";
+import { findUserRecord } from "@/app/_server/actions/users/records";
+import type { Metadata } from "next";
+import { getMedatadaTitle } from "@/app/_server/actions/config";
+import { Modes, ItemTypes } from "@/app/_types/enums";
+import { UNCATEGORIZED } from "@/app/_consts/notes";
+import { isPublicItem } from "@/app/_server/actions/share/queries";
+import { MetadataProvider } from "@/app/_providers/MetadataProvider";
+import { PermissionsProvider } from "@/app/_providers/PermissionsProvider";
+import { sanitizeUserForPublic } from "@/app/_utils/user-sanitize-utils";
+import { isLegacyUrl } from "@/app/_consts/attachments";
+import { decodeSegment } from "@/app/_utils/global-utils";
+
+interface PublicNotePageProps {
+  params: Promise<{
+    uuid: string;
+  }>;
+  searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
+}
+
+export const dynamic = "force-dynamic";
+
+export async function generateMetadata(
+  props: PublicNotePageProps,
+): Promise<Metadata> {
+  const params = await props.params;
+  return getMedatadaTitle(Modes.NOTES, params.uuid);
+}
+
+export default async function PublicNotePage(props: PublicNotePageProps) {
+  const params = await props.params;
+  const { uuid } = params;
+
+  if (!isUuid(uuid)) {
+    const { publicResolve } = await import("@/app/_server/actions/lib/legacy-lookup");
+    const resolved = await publicResolve(
+      Modes.NOTES,
+      UNCATEGORIZED,
+      decodeSegment(uuid),
+      ItemTypes.NOTE,
+    );
+
+    if (resolved) {
+      permanentRedirect(`/public/note/${resolved}`);
+    }
+
+    redirect("/");
+  }
+
+  const note = await getNoteById(uuid);
+
+  if (!note) {
+    redirect("/");
+  }
+
+  const userRecord = await findUserRecord(note.owner!);
+  const user = sanitizeUserForPublic(
+    userRecord,
+    !isLegacyUrl(userRecord?.avatarUrl),
+  );
+
+  const isPubliclyShared = await isPublicItem(note.uuid!, ItemTypes.NOTE);
+
+  const currentUser = await getCurrentUser();
+  const isOwner = currentUser?.username === note.owner;
+
+  if (isPubliclyShared || isOwner) {
+    const metadata = {
+      id: note.id,
+      uuid: note.uuid,
+      title: note.title,
+      category: note.category || UNCATEGORIZED,
+      owner: note.owner,
+      createdAt: note.createdAt,
+      updatedAt: note.updatedAt,
+      type: "note" as const,
+    };
+
+    return (
+      <MetadataProvider metadata={metadata}>
+        <PermissionsProvider item={note}>
+          <PublicNoteView note={note} user={user} />
+        </PermissionsProvider>
+      </MetadataProvider>
+    );
+  }
+
+  redirect("/");
+}

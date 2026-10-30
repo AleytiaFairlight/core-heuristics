@@ -19,33 +19,46 @@ import { getCategories } from "@/app/_server/actions/category";
 import { Modes } from "./_types/enums";
 import { getCurrentUser, getUsers } from "./_server/actions/users";
 import { readPackageVersion } from "@/app/_server/actions/config";
-import { readLinkIndex } from "@/app/_server/actions/link";
 import { headers } from "next/headers";
 import {
   themeInitScript,
   getThemeBackgroundColor,
-  rgbToHex,
 } from "./_consts/themes";
+import { THEME_COLOR_META } from "./_utils/theme-color-utils";
 import { loadCustomThemes } from "./_server/actions/config";
-import { getUserChecklists } from "./_server/actions/checklist";
-import { getUserNotes } from "./_server/actions/note";
+import { getUserChecklists } from "./_server/actions/checklist/queries";
+import { getUserNotes } from "./_server/actions/note/queries";
+import { sidebarSnapshot, sidebarStampOf } from "./_server/actions/sidebar/listing";
+import type { Category, SidebarEntry } from "./_types";
+import { libraryStatsOf } from "./_utils/catalog-utils";
+import { buildTagsIndex } from "./_utils/tag-utils";
 
 import SuppressWarnings from "./_components/GlobalComponents/Layout/SuppressWarnings";
 import {
-  getAllSharedItems,
-  getAllSharedItemsForUser,
-  readShareFile,
-} from "./_server/actions/sharing";
+  allShared,
+  sharedForUser,
+  globalShares,
+} from "./_server/actions/share/queries";
 import { generateWebManifest } from "./_utils/global-utils";
-import { writeJsonFile } from "./_server/actions/file";
+import { readJsonFile, writeJsonFile } from "./_server/actions/file";
 import path from "path";
 import { NextIntlClientProvider } from "next-intl";
 import { getMessages } from "next-intl/server";
 import { getAvailableLocalesWithNames } from "@/app/_utils/locale-utils";
-import { sanitizeUserForClient } from "@/app/_utils/user-sanitize-utils";
 import { KonamiProvider } from "./_providers/KonamiProvider";
 import { WebSocketProvider } from "./_providers/WebSocketProvider";
 import { isEnvEnabled } from "./_utils/env-utils";
+import {
+  ADMIN_BORDER_RADIUS_VAR,
+  USER_BORDER_RADIUS_VAR,
+  USER_NOTE_FONT_SIZE_VAR,
+  normaliseNoteFontSize,
+  noteFontSizeToPx,
+  radiusToRem,
+} from "./_consts/styling";
+
+const serverThemeId = (isRwMarkable?: boolean, preferredTheme?: string) =>
+  isRwMarkable ? "rwmarkable-dark" : preferredTheme || "dark";
 
 export const generateMetadata = async (): Promise<Metadata> => {
   const settings = await getSettings();
@@ -67,11 +80,9 @@ export const generateMetadata = async (): Promise<Metadata> => {
   const app192x192Icon =
     settings?.["192x192Icon"] || "/app-icons/android-chrome-192x192.png";
 
-  const defaultTheme = settings?.isRwMarkable
-    ? "rwmarkable-dark"
-    : user?.preferredTheme || "dark";
-
-  const themeColor = getThemeBackgroundColor(defaultTheme);
+  const themeColor = getThemeBackgroundColor(
+    serverThemeId(settings?.isRwMarkable, user?.preferredTheme),
+  );
 
   const manifest = JSON.parse(
     generateWebManifest(
@@ -88,7 +99,11 @@ export const generateMetadata = async (): Promise<Metadata> => {
   );
 
   try {
-    await writeJsonFile(manifest, path.join("data", "site.webmanifest"));
+    const manifestPath = path.join("data", "site.webmanifest");
+    const stored = await readJsonFile(manifestPath);
+    if (JSON.stringify(stored) !== JSON.stringify(manifest)) {
+      await writeJsonFile(manifest, manifestPath);
+    }
   } catch (error) {
     console.error(
       "Your data and/or config folders seem to be using the wrong permissions, please fix them by following the instructions here: https://github.com/fccview/jotty/blob/main/howto/DOCKER.md and/or setting the correct env variables from here: https://github.com/fccview/jotty/blob/main/howto/ENV-VARIABLES.md",
@@ -99,7 +114,6 @@ export const generateMetadata = async (): Promise<Metadata> => {
   return {
     title: appName,
     description: appDescription,
-    manifest: "/api/manifest",
     icons: {
       icon: [
         {
@@ -129,22 +143,12 @@ export const generateMetadata = async (): Promise<Metadata> => {
   };
 };
 
-export const viewport: Viewport = {
-  width: "device-width",
-  initialScale: 1,
-  themeColor: rgbToHex("12 20 53"),
-};
-
 export async function generateViewport(): Promise<Viewport> {
-  const settings = await getSettings();
-  const defaultTheme = settings?.isRwMarkable ? "rwmarkable-dark" : "dark";
-  const themeColor = getThemeBackgroundColor(defaultTheme);
   const pwaZoomEnabled = isEnvEnabled(process.env.ENABLE_PWA_ZOOM);
 
   return {
     width: "device-width",
     initialScale: 1,
-    themeColor,
     viewportFit: "cover",
     ...(!pwaZoomEnabled && { maximumScale: 1, userScalable: false }),
   };
@@ -160,18 +164,18 @@ export default async function RootLayout({
   const settings = await getSettings();
   const appName =
     settings?.appName || (settings?.isRwMarkable ? "rwMarkable" : "jotty·page");
-  const noteCategories = await getCategories(Modes.NOTES);
-  const checklistCategories = await getCategories(Modes.CHECKLISTS);
-  const userRecord = await getCurrentUser();
+  const user = await getCurrentUser();
   const appVersion = await readPackageVersion();
   const customThemes = await loadCustomThemes();
   const stopCheckUpdates = process.env.STOP_CHECK_UPDATES;
-  const users = isPublicRoute || !userRecord ? [] : await getUsers();
-  const linkIndex = userRecord?.username
-    ? await readLinkIndex(userRecord.username)
-    : null;
+  const users = isPublicRoute || !user ? [] : await getUsers();
+  const noteCategories = user
+    ? await getCategories(Modes.NOTES)
+    : { success: false, data: [] };
+  const checklistCategories = user
+    ? await getCategories(Modes.CHECKLISTS)
+    : { success: false, data: [] };
   const messages = await getMessages();
-  const user = sanitizeUserForClient(userRecord);
 
   const [
     notesResult,
@@ -196,16 +200,16 @@ export default async function RootLayout({
         })
       : Promise.resolve({ success: false, data: [] }),
     user && !isPublicRoute
-      ? getAllSharedItems()
+      ? allShared()
       : Promise.resolve({
           notes: [],
           checklists: [],
           public: { notes: [], checklists: [] },
         }),
     user && !isPublicRoute
-      ? getAllSharedItemsForUser(user.username)
+      ? sharedForUser(user.username)
       : Promise.resolve({ notes: [], checklists: [] }),
-    user && !isPublicRoute ? readShareFile("all") : Promise.resolve(null),
+    user && !isPublicRoute ? globalShares() : Promise.resolve(null),
     getAvailableLocalesWithNames(),
   ]);
 
@@ -213,6 +217,15 @@ export default async function RootLayout({
   const checklists = checklistsResult.success
     ? checklistsResult.data || []
     : [];
+  const snapshotOf = (items: SidebarEntry[], categories: Category[]) =>
+    sidebarSnapshot(items, categories, sidebarStampOf(items, categories));
+  const sidebar =
+    user && !isPublicRoute
+      ? {
+          [Modes.NOTES]: snapshotOf(notes as SidebarEntry[], noteCategories.data || []),
+          [Modes.CHECKLISTS]: snapshotOf(checklists as SidebarEntry[], checklistCategories.data || []),
+        }
+      : {};
 
   let serveUpdates = true;
 
@@ -226,14 +239,36 @@ export default async function RootLayout({
       suppressHydrationWarning
       data-rwmarkable={settings?.isRwMarkable ? "true" : "false"}
       data-user-theme={user?.preferredTheme || ""}
+      style={
+        {
+          [ADMIN_BORDER_RADIUS_VAR]: radiusToRem(settings?.borderRadius),
+          ...(typeof user?.preferredBorderRadius === "number" && {
+            [USER_BORDER_RADIUS_VAR]: radiusToRem(user.preferredBorderRadius),
+          }),
+          ...(normaliseNoteFontSize(user?.notesFontSize) && {
+            [USER_NOTE_FONT_SIZE_VAR]: noteFontSizeToPx(user?.notesFontSize),
+          }),
+        } as React.CSSProperties
+      }
     >
       <head>
         {process.env.NODE_ENV === "development" && <SuppressWarnings />}
+        <link
+          rel="manifest"
+          href="/api/manifest"
+          crossOrigin="use-credentials"
+        />
         <link rel="icon" href="/app-icons/favicon.ico" />
         <meta name="apple-mobile-web-app-capable" content="yes" />
         <meta name="apple-mobile-web-app-status-bar-style" content="default" />
         <meta name="apple-mobile-web-app-title" content={appName} />
         <meta name="mobile-web-app-capable" content="yes" />
+        <meta
+          name={THEME_COLOR_META}
+          content={getThemeBackgroundColor(
+            serverThemeId(settings?.isRwMarkable, user?.preferredTheme),
+          )}
+        />
         <script
           dangerouslySetInnerHTML={{
             __html: themeInitScript(
@@ -252,9 +287,11 @@ export default async function RootLayout({
             pathname={pathname || ""}
             initialSettings={settings}
             usersPublicData={users}
-            linkIndex={linkIndex}
-            notes={notes}
-            checklists={checklists}
+            library={libraryStatsOf(notes, checklists)}
+            tagsIndex={
+              settings?.editor?.enableTags === false ? undefined : buildTagsIndex(notes, checklists)
+            }
+            sidebar={sidebar}
             allSharedItems={allSharedItems}
             userSharedItems={userSharedItems}
             globalSharing={globalSharing}
@@ -262,7 +299,7 @@ export default async function RootLayout({
           >
             <WebSocketProvider>
               <KonamiProvider>
-                <ThemeProvider user={user || {}}>
+                <ThemeProvider>
                   <EmojiProvider>
                     <NavigationGuardProvider>
                       <ToastProvider>

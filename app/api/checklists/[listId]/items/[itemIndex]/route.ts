@@ -1,97 +1,87 @@
-import { NextRequest, NextResponse } from "next/server";
-import { withApiAuth } from "@/app/_utils/api-utils";
-import { getListById } from "@/app/_server/actions/checklist";
-import { listToMarkdown } from "@/app/_utils/checklist-utils";
-import { serverWriteFile } from "@/app/_server/actions/file";
-import path from "path";
-
-const CHECKLISTS_FOLDER = "checklists";
+import { NextResponse } from "next/server";
+import { findListItem, isRefusal } from "@/app/_utils/api-list-utils";
+import { editItem } from "@/app/_server/actions/checklist-item/editor";
+import { removeItem } from "@/app/_server/actions/checklist-item/remover";
+import { defineRoute, refuse } from "@/app/_server/api/define-route";
+import { ApiTag, HttpMethod } from "@/app/_server/api/contract";
+import { ERRORS, okSchema } from "@/app/_schemas/api/common";
+import { itemUpdateBody, listItemParams } from "@/app/_schemas/api/checklists";
+import { PermissionTypes } from "@/app/_types/enums";
 
 export const dynamic = "force-dynamic";
 
-export async function DELETE(
-  request: NextRequest,
-  props: { params: Promise<{ listId: string; itemIndex: string }> }
-) {
-  const params = await props.params;
-  return withApiAuth(request, async (user) => {
-    try {
-      const list = await getListById(params.listId, user.username);
-      if (!list) {
-        return NextResponse.json({ error: "List not found" }, { status: 404 });
-      }
+const _blankable = (value: string | number | null) => (value === null ? "" : String(value));
 
-      const indexPath = params.itemIndex.split('.').map(i => parseInt(i));
+export const PATCH = defineRoute(
+  {
+    id: "updateChecklistItem",
+    method: HttpMethod.PATCH,
+    path: "/checklists/{listId}/items/{itemIndex}",
+    tag: ApiTag.CHECKLIST_ITEMS,
+    summary: "Update a checklist item",
+    description:
+      "Send at least one field. Fields left out keep their value, null clears every field except text. Needs edit permission.",
+    params: listItemParams,
+    body: itemUpdateBody,
+    responses: {
+      200: { description: "Updated", schema: okSchema },
+      400: { description: "Invalid input or item index out of range", schema: ERRORS[400].schema },
+      401: ERRORS[401],
+      403: ERRORS[403],
+      404: ERRORS[404],
+      500: { description: "Write failed", schema: ERRORS[500].schema },
+    },
+  },
+  async ({ request, user, params, body }) => {
+    const found = await findListItem(request, params.listId, params.itemIndex, user.username, PermissionTypes.EDIT);
+    if (isRefusal(found)) return found.refusal;
 
-      for (const idx of indexPath) {
-        if (isNaN(idx) || idx < 0) {
-          return NextResponse.json(
-            { error: "Invalid item index" },
-            { status: 400 }
-          );
-        }
-      }
+    const formData = new FormData();
+    formData.append("itemId", found.item.id);
+    if (body.text !== undefined) formData.append("text", body.text);
+    if (body.description !== undefined) formData.append("description", _blankable(body.description));
+    if (body.priority !== undefined) formData.append("priority", _blankable(body.priority));
+    if (body.score !== undefined) formData.append("score", _blankable(body.score));
+    if (body.startDate !== undefined) formData.append("startDate", _blankable(body.startDate));
+    if (body.targetDate !== undefined) formData.append("targetDate", _blankable(body.targetDate));
+    if (body.estimatedTime !== undefined) formData.append("estimatedTime", _blankable(body.estimatedTime));
 
-      let item: any = null;
-      let currentItems = list.items;
-
-      for (const idx of indexPath) {
-        if (idx >= currentItems.length) {
-          return NextResponse.json(
-            { error: "Item index out of range" },
-            { status: 400 }
-          );
-        }
-        item = currentItems[idx];
-        currentItems = item.children || [];
-      }
-
-      if (!item) {
-        return NextResponse.json(
-          { error: "Item not found" },
-          { status: 404 }
-        );
-      }
-
-      const filterOutItem = (items: any[], itemId: string): any[] => {
-        return items
-          .filter((item) => item.id !== itemId)
-          .map((item) => {
-            const filteredChildren = item.children ? filterOutItem(item.children, itemId) : undefined;
-            return {
-              ...item,
-              children: filteredChildren && filteredChildren.length > 0 ? filteredChildren : undefined,
-            };
-          });
-      };
-
-      const updatedList = {
-        ...list,
-        items: filterOutItem(list.items || [], item.id),
-        updatedAt: new Date().toISOString(),
-      };
-
-      const ownerDir = path.join(
-        process.cwd(),
-        "data",
-        CHECKLISTS_FOLDER,
-        list.owner!
-      );
-      const filePath = path.join(
-        ownerDir,
-        list.category || "Uncategorized",
-        `${list.id}.md`
-      );
-
-      await serverWriteFile(filePath, listToMarkdown(updatedList as any));
-
-      return NextResponse.json({ success: true });
-    } catch (error) {
-      console.error("API Error:", error);
-      return NextResponse.json(
-        { error: "Internal server error" },
-        { status: 500 }
-      );
+    const result = await editItem(user, found.list, formData, true);
+    if (!result.success) {
+      return refuse(result.error || "Failed to update item", 500);
     }
-  });
-}
+
+    return NextResponse.json({ success: true });
+  },
+);
+
+export const DELETE = defineRoute(
+  {
+    id: "deleteChecklistItem",
+    method: HttpMethod.DELETE,
+    path: "/checklists/{listId}/items/{itemIndex}",
+    tag: ApiTag.CHECKLIST_ITEMS,
+    summary: "Delete a checklist item",
+    description: "Removes the item and its sub-items. Needs delete permission.",
+    params: listItemParams,
+    responses: {
+      200: { description: "Deleted", schema: okSchema },
+      400: { description: "Invalid or out of range item index", schema: ERRORS[400].schema },
+      401: ERRORS[401],
+      403: ERRORS[403],
+      404: ERRORS[404],
+      500: ERRORS[500],
+    },
+  },
+  async ({ request, user, params }) => {
+    const found = await findListItem(request, params.listId, params.itemIndex, user.username, PermissionTypes.DELETE);
+    if (isRefusal(found)) return found.refusal;
+
+    const result = await removeItem(user, found.list.uuid!, found.item.id);
+    if (!result.success) {
+      return refuse(result.error || "Failed to delete item", 500);
+    }
+
+    return NextResponse.json({ success: true });
+  },
+);

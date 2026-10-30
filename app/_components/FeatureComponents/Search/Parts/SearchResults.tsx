@@ -5,9 +5,11 @@ import { cn } from "@/app/_utils/global-utils";
 import { ItemType } from "@/app/_types";
 import { ItemTypes } from "@/app/_types/enums";
 import { useTranslations } from "next-intl";
+import { IndexingRelations } from "@/app/_components/GlobalComponents/Layout/IndexingRelations";
 
 interface SearchResult {
   id: string;
+  uuid?: string;
   title: string;
   type: ItemType;
   content?: string;
@@ -21,6 +23,8 @@ interface SearchResultsProps {
   selectedIndex: number;
   onSelectResult: (result: SearchResult) => void;
   query: string;
+  indexing?: boolean;
+  searching?: boolean;
 }
 
 export const SearchResults = ({
@@ -28,6 +32,8 @@ export const SearchResults = ({
   selectedIndex,
   onSelectResult,
   query,
+  indexing = false,
+  searching = false,
 }: SearchResultsProps) => {
   const t = useTranslations();
 
@@ -35,7 +41,9 @@ export const SearchResults = ({
     if (!content) return null;
 
     const lowerContent = content.toLowerCase();
-    const lowerQuery = query.toLowerCase();
+    const needles = [query, ...query.split(/\s+/)].map((part) => part.trim().toLowerCase());
+    const lowerQuery =
+      needles.find((part) => part.length > 1 && lowerContent.includes(part)) || needles[0];
     const index = lowerContent.indexOf(lowerQuery);
 
     if (index === -1) {
@@ -44,11 +52,11 @@ export const SearchResults = ({
     }
 
     const start = Math.max(0, index - 50);
-    const end = Math.min(content.length, index + query.length + 70);
+    const end = Math.min(content.length, index + lowerQuery.length + 70);
 
     const before = content.slice(start, index);
-    const match = content.slice(index, index + query.length);
-    const after = content.slice(index + query.length, end);
+    const match = content.slice(index, index + lowerQuery.length);
+    const after = content.slice(index + lowerQuery.length, end);
 
     return (
       <>
@@ -60,6 +68,14 @@ export const SearchResults = ({
       </>
     );
   };
+
+  if (results.length === 0 && indexing) {
+    return <IndexingRelations compact label={t("relations.indexingSearch")} />;
+  }
+
+  if (results.length === 0 && searching) {
+    return <IndexingRelations compact label={t("common.searching")} />;
+  }
 
   if (results.length === 0) {
     return (
@@ -73,7 +89,7 @@ export const SearchResults = ({
     <div className="max-h-[50vh] overflow-y-auto">
       {results.map((result, index) => (
         <button
-          key={result.id}
+          key={result.uuid || result.id}
           onClick={() => onSelectResult(result)}
           className={cn(
             "w-full border-b border-border p-4 text-left transition-colors last:border-b-0 hover:bg-accent hover:text-accent-foreground md:p-3",

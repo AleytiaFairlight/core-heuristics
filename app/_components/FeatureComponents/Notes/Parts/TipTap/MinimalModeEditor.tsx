@@ -1,25 +1,31 @@
 "use client";
 
 import { useState, useCallback, useEffect } from "react";
-import {
-  ViewIcon,
-  File02Icon,
-} from "hugeicons-react";
+import { ViewIcon, File02Icon } from "hugeicons-react";
 import { SyntaxHighlightedEditor } from "./SyntaxHighlightedEditor";
 import { UnifiedMarkdownRenderer } from "@/app/_components/FeatureComponents/Notes/Parts/UnifiedMarkdownRenderer";
 import { ReadingProgressBar } from "@/app/_components/GlobalComponents/Layout/ReadingProgressBar";
 import { extractYamlMetadata } from "@/app/_utils/yaml-metadata-utils";
 import { Button } from "@/app/_components/GlobalComponents/Buttons/Button";
 import { useTranslations } from "next-intl";
-import { useAppMode } from "@/app/_providers/AppModeProvider";
+import {
+  QuickBarPortal,
+  QuickBarSlots,
+  quickBarButton,
+} from "@/app/_components/FeatureComponents/Notes/Parts/NoteEditor/NoteQuickBar";
 import { useNotesStore } from "@/app/_utils/notes-store";
 import { VisualGuideRuler } from "./VisualGuideRuler";
 import { EditorSettingsDropdown } from "./Toolbar/EditorSettingsDropdown";
+import { NOTE_PROSE_CLASS } from "@/app/_consts/notes";
 
 interface MinimalModeEditorProps {
   isEditing: boolean;
   noteContent: string;
-  onEditorContentChange: (content: string, isMarkdown: boolean, isDirty: boolean) => void;
+  onEditorContentChange: (
+    content: string,
+    isMarkdown: boolean,
+    isDirty: boolean,
+  ) => void;
   compactMode: boolean;
 }
 
@@ -30,11 +36,11 @@ export const MinimalModeEditor = ({
   compactMode,
 }: MinimalModeEditorProps) => {
   const t = useTranslations();
-  const { user } = useAppMode();
-  const { showLineNumbers, showRuler, showVisualGuides, visualGuideColumns } = useNotesStore();
+  const { showLineNumbers, showRuler, showVisualGuides, visualGuideColumns } =
+    useNotesStore();
   const { contentWithoutMetadata } = extractYamlMetadata(noteContent);
   const [markdownContent, setMarkdownContent] = useState(
-    contentWithoutMetadata
+    contentWithoutMetadata,
   );
   const [showPreview, setShowPreview] = useState(false);
   const [charWidth, setCharWidth] = useState(0);
@@ -59,7 +65,7 @@ export const MinimalModeEditor = ({
       setMarkdownContent(newContent);
       onEditorContentChange(newContent, true, true);
     },
-    [onEditorContentChange]
+    [onEditorContentChange],
   );
 
   const handleFileDrop = useCallback((files: File[]) => {
@@ -71,10 +77,11 @@ export const MinimalModeEditor = ({
       <>
         <ReadingProgressBar />
         <div
-          className={`px-6 pt-6 pb-12 ${compactMode ? "max-w-[900px] mx-auto" : ""
-            }`}
+          className={`px-6 pt-6 pb-4 ${
+            compactMode ? "max-w-[900px] mx-auto" : ""
+          }`}
         >
-          <UnifiedMarkdownRenderer content={noteContent} />
+          <UnifiedMarkdownRenderer content={noteContent} className={NOTE_PROSE_CLASS} />
         </div>
       </>
     );
@@ -100,14 +107,19 @@ export const MinimalModeEditor = ({
         </div>
       </div>
 
-      <div className={`fixed bottom-[130px] ${user?.handedness === "left-handed" ? "left-[2.5%]" : "right-[2.5%]"} lg:hidden z-40 flex flex-col gap-1 bg-background border border-border rounded-jotty p-1`}>
+      <QuickBarPortal
+        slot={QuickBarSlots.MODES}
+        fallbackClassName="flex lg:hidden justify-end gap-1 p-1"
+      >
         <Button
           variant={showPreview ? "default" : "ghost"}
           size="icon"
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => setShowPreview(true)}
           title={t("editor.previewMode")}
-          className="h-10 w-10"
+          aria-label={t("editor.previewMode")}
+          aria-pressed={showPreview}
+          className={quickBarButton}
         >
           <ViewIcon className="h-5 w-5" />
         </Button>
@@ -118,24 +130,27 @@ export const MinimalModeEditor = ({
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => setShowPreview(false)}
           title={t("editor.markdownEditor")}
-          className="h-10 w-10"
+          aria-label={t("editor.markdownEditor")}
+          aria-pressed={!showPreview}
+          className={quickBarButton}
         >
           <File02Icon className="h-5 w-5" />
         </Button>
-      </div>
+      </QuickBarPortal>
       {!showPreview && showRuler && (
         <VisualGuideRuler
           charWidth={charWidth}
           showLineNumbers={showLineNumbers}
         />
       )}
-      <div className="flex-1 overflow-y-auto jotty-scrollable-content max-h-[95vh]">
+      <div className="flex-1 overflow-y-auto jotty-scrollable-content min-h-0">
         {showPreview ? (
           <div
-            className={`px-6 pt-6 pb-12 ${compactMode ? "max-w-[900px] mx-auto" : ""
-              }`}
+            className={`px-6 pt-6 pb-4 ${
+              compactMode ? "max-w-[900px] mx-auto" : ""
+            }`}
           >
-            <UnifiedMarkdownRenderer content={markdownContent} />
+            <UnifiedMarkdownRenderer content={markdownContent} className={NOTE_PROSE_CLASS} />
           </div>
         ) : (
           <div className="lg:p-4 h-full">

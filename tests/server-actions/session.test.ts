@@ -1,5 +1,12 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { mockCookies, mockFs, resetAllMocks, createFormData } from "../setup";
+import {
+  mockCookies,
+  mockFs,
+  mockLock,
+  mockUnlock,
+  resetAllMocks,
+  createFormData,
+} from "../setup";
 
 const mockReadJsonFile = vi.fn();
 const mockWriteJsonFile = vi.fn();
@@ -39,6 +46,9 @@ import {
   getSessionId,
   removeAllSessionsForUser,
   clearAllSessions,
+} from "@/app/_server/actions/session/store";
+import {
+  getMySessions,
   terminateSession,
   terminateAllOtherSessions,
 } from "@/app/_server/actions/session";
@@ -217,20 +227,48 @@ describe("Session Actions", () => {
   });
 
   describe("clearAllSessions", () => {
-    it("should clear all sessions", async () => {
+    it("should clear both session files", async () => {
       const result = await clearAllSessions();
 
       expect(result.success).toBe(true);
-      expect(mockFs.writeFile).toHaveBeenCalledTimes(2);
+      expect(mockWriteJsonFile).toHaveBeenCalledTimes(2);
+      expect(mockWriteJsonFile.mock.calls[0][0]).toEqual({});
+      expect(mockWriteJsonFile.mock.calls[1][0]).toEqual({});
     });
 
     it("should handle errors", async () => {
-      mockFs.writeFile.mockRejectedValue(new Error("Write error"));
+      mockWriteJsonFile.mockRejectedValue(new Error("Write error"));
 
       const result = await clearAllSessions();
 
       expect(result.success).toBe(false);
       expect(result.error).toBe("Failed to clear all sessions");
+    });
+  });
+
+  describe("session file locking", () => {
+    it("should hold the lock across every mutation", async () => {
+      await createSession("session-123", "testuser", "local");
+
+      expect(mockLock).toHaveBeenCalledTimes(1);
+      expect(mockUnlock).toHaveBeenCalledTimes(1);
+      expect(mockWriteJsonFile).toHaveBeenCalledTimes(2);
+    });
+
+    it("should skip the write when the lock is unavailable", async () => {
+      mockLock.mockRejectedValue(new Error("Locked"));
+
+      await createSession("session-123", "testuser", "local");
+
+      expect(mockWriteJsonFile).not.toHaveBeenCalled();
+    });
+
+    it("should release the lock when the mutation throws", async () => {
+      mockWriteJsonFile.mockRejectedValue(new Error("Write error"));
+
+      await removeSession("session-123");
+
+      expect(mockUnlock).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -256,7 +294,12 @@ describe("Session Actions", () => {
     });
 
     it("should terminate session successfully", async () => {
-      mockReadJsonFile.mockResolvedValue({});
+      mockReadJsonFile.mockResolvedValue({
+        "session-to-terminate": {
+          id: "session-to-terminate",
+          username: "testuser",
+        },
+      });
 
       const formData = createFormData({ sessionId: "session-to-terminate" });
 
@@ -268,6 +311,29 @@ describe("Session Actions", () => {
         "testuser",
         true,
       );
+    });
+  });
+
+  describe("getMySessions", () => {
+    it("should refuse without a session", async () => {
+      mockGetCurrentUser.mockResolvedValue(null);
+
+      expect(await getMySessions()).toBeNull();
+    });
+
+    it("should only list the caller's sessions and flag the current one", async () => {
+      mockReadJsonFile.mockResolvedValue({
+        "session-123": { id: "session-123", username: "testuser" },
+        "session-456": { id: "session-456", username: "testuser" },
+        "session-789": { id: "session-789", username: "victim" },
+      });
+
+      const result = await getMySessions();
+
+      expect(result?.map((s) => [s.id, s.isCurrent])).toEqual([
+        ["session-123", true],
+        ["session-456", false],
+      ]);
     });
   });
 

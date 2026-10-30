@@ -1,0 +1,133 @@
+import { describe, it, expect, vi } from "vitest";
+import { listToMarkdown, parseMarkdown } from "@/app/_utils/checklist-utils";
+import { parseChecklistContent } from "@/app/_utils/client-parser-utils";
+import { ChecklistsTypes } from "@/app/_types/enums";
+
+vi.unmock("@/app/_utils/checklist-utils");
+
+const SHARED_BOARD = [
+  "---",
+  "uuid: board-uuid-1",
+  "title: Shared Board",
+  "checklistType: kanban",
+  "tags:",
+  "  - work",
+  "sharedWith: 'dawid:w, public:r'",
+  "---",
+  '- [ ] Card one | metadata:{"id":"card-1"}',
+].join("\n");
+
+describe("checklist frontmatter round-trip", () => {
+  it("keeps sharing and tags when a board is parsed and written back", () => {
+    const parsed = parseChecklistContent(SHARED_BOARD, "shared-board");
+
+    expect(parsed.sharedWith).toBe("dawid:w, public:r");
+    expect(parsed.tags).toEqual(["work"]);
+
+    const markdown = listToMarkdown({
+      id: "shared-board",
+      uuid: parsed.uuid!,
+      title: parsed.title,
+      type: ChecklistsTypes.KANBAN,
+      category: "Uncategorized",
+      items: parsed.items,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      owner: "fccview",
+      tags: parsed.tags,
+      sharedWith: parsed.sharedWith,
+    });
+
+    expect(parseChecklistContent(markdown, "shared-board").sharedWith).toBe(
+      "dawid:w, public:r",
+    );
+    expect(markdown).toContain("work");
+  });
+
+  it("carries sharedWith from parseMarkdown into the written file", () => {
+    const list = parseMarkdown(
+      SHARED_BOARD,
+      "shared-board",
+      "Uncategorized",
+      "fccview",
+    );
+
+    expect(list.sharedWith).toBe("dawid:w, public:r");
+    expect(listToMarkdown(list)).toContain("sharedWith:");
+  });
+
+  it("keeps foreign frontmatter across a parse and write back", () => {
+    const imported = [
+      "---",
+      "uuid: board-uuid-2",
+      "title: Imported Board",
+      "checklistType: kanban",
+      "aliases:",
+      "  - groceries",
+      "  - errands",
+      "cssclasses: [compact]",
+      "publish: true",
+      "source:",
+      "  app: obsidian",
+      "---",
+      "- [ ] Card one",
+    ].join("\n");
+
+    const list = parseMarkdown(
+      imported,
+      "imported-board",
+      "Uncategorized",
+      "fccview",
+    );
+
+    expect(list.extraMetadata).toEqual({
+      aliases: ["groceries", "errands"],
+      cssclasses: ["compact"],
+      publish: true,
+      source: { app: "obsidian" },
+    });
+
+    const markdown = listToMarkdown({ ...list, title: "Renamed Board" });
+    const reparsed = parseMarkdown(
+      markdown,
+      "imported-board",
+      "Uncategorized",
+      "fccview",
+    );
+
+    expect(reparsed.extraMetadata).toEqual(list.extraMetadata);
+    expect(reparsed.title).toBe("Renamed Board");
+    expect(reparsed.uuid).toBe("board-uuid-2");
+    expect(parseChecklistContent(markdown, "imported-board").extraMetadata)
+      .toEqual(list.extraMetadata);
+  });
+
+  it("omits sharedWith for boards that were never shared", () => {
+    const plain = [
+      "---",
+      "uuid: plain-1",
+      "title: Plain",
+      "---",
+      "- [ ] Only card",
+    ].join("\n");
+
+    const list = parseMarkdown(plain, "plain", "Uncategorized", "fccview");
+
+    expect(list.sharedWith).toBeUndefined();
+    expect(listToMarkdown(list)).not.toContain("sharedWith");
+  });
+
+  it("keeps a multi-line description on one item line", () => {
+    const list = parseMarkdown(SHARED_BOARD, "shared-board", "Uncategorized", "fccview");
+    list.items[0].description = "first line\r\n\n- a | b";
+
+    const markdown = listToMarkdown(list);
+    const itemLines = markdown.split("\n").filter((line) => line.startsWith("- ["));
+
+    expect(itemLines).toHaveLength(1);
+
+    const reparsed = parseMarkdown(markdown, "shared-board", "Uncategorized", "fccview");
+    expect(reparsed.items[0].id).toBe("card-1");
+    expect(reparsed.items[0].description).toBe("first line\\n\\n- a | b");
+  });
+});

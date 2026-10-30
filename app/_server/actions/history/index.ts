@@ -2,273 +2,52 @@
 
 import path from "path";
 import fs from "fs/promises";
-import simpleGit, { SimpleGit } from "simple-git";
-import { lock, unlock } from "proper-lockfile";
 import { NOTES_FOLDER } from "@/app/_consts/notes";
 import { getCurrentUser } from "@/app/_server/actions/users";
-import { checkUserPermission } from "@/app/_server/actions/sharing";
-import { PermissionTypes } from "@/app/_types/enums";
-import { getSettings } from "@/app/_server/actions/config";
+import { reachableFile } from "@/app/_server/actions/share/queries";
+import { ItemTypes, PermissionTypes } from "@/app/_types/enums";
 import { USERS_FILE } from "@/app/_consts/files";
 import { readJsonFile } from "@/app/_server/actions/file";
+import {
+  dropLegacyLock,
+  ensureRepo,
+  historyEnabled,
+  historyLockPath,
+  notesRepoDir,
+  parseCommit,
+  repoGit,
+} from "./repo";
+import type { HistoryEntry, HistoryResult, HistoryVersion } from "./repo";
 
-export interface HistoryEntry {
-  commitHash: string;
-  date: string;
-  message: string;
-  action: string;
-  title: string;
-}
+export type { HistoryEntry, HistoryVersion };
 
-export interface HistoryVersion {
-  commitHash: string;
-  date: string;
-  content: string;
-  title: string;
-}
+const _ownerOf = (filePath: string): string =>
+  path
+    .relative(path.join(process.cwd(), "data", NOTES_FOLDER), filePath)
+    .split(path.sep)[0];
 
-interface HistoryResult<T> {
-  success: boolean;
-  data?: T;
-  error?: string;
-}
-
-type HistoryAction = "create" | "update" | "rename" | "move" | "delete";
-
-const USER_NOTES_DIR = (username: string) =>
-  path.join(process.cwd(), "data", NOTES_FOLDER, username);
-
-const GITIGNORE_CONTENT = `.index.json
-.order.json
-*.lock
-.historylock
-images/
-files/
-videos/
-*.tmp
-*.swp
-*~`;
-
-const _getGitInstance = (userDir: string): SimpleGit => {
-  return simpleGit(userDir, {
-    binary: "git",
-    maxConcurrentProcesses: 1,
-    trimmed: true,
-  });
-};
-
-const _formatCommitMessage = (
-  action: HistoryAction,
-  noteTitle: string,
-  metadata?: { oldTitle?: string; oldCategory?: string; newCategory?: string }
-): string => {
-  switch (action) {
-    case "create":
-      return `[create] ${noteTitle}`;
-    case "update":
-      return `[update] ${noteTitle}`;
-    case "rename":
-      return `[rename] "${metadata?.oldTitle}" -> "${noteTitle}"`;
-    case "move":
-      return `[move] ${noteTitle}: ${metadata?.oldCategory} -> ${metadata?.newCategory}`;
-    case "delete":
-      return `[delete] ${noteTitle}`;
-    default:
-      return `[change] ${noteTitle}`;
-  }
-};
-
-const _parseCommitMessage = (
-  message: string
-): { action: string; title: string } => {
-  const match = message.match(/^\[(\w+)\]\s*(.*)$/);
-  if (match) {
-    return { action: match[1], title: match[2] };
-  }
-  return { action: "update", title: message };
-};
-
-const _isHistoryEnabled = async (): Promise<boolean> => {
-  try {
-    const settings = await getSettings();
-    return settings?.editor?.historyEnabled === true;
-  } catch {
-    return false;
-  }
-};
-
-export const ensureRepo = async (username: string): Promise<void> => {
-  const userDir = USER_NOTES_DIR(username);
-  const gitDir = path.join(userDir, ".git");
-
-  try {
-    await fs.access(gitDir);
-  } catch {
-    const git = _getGitInstance(userDir);
-    await git.init();
-
-    await git.addConfig("user.email", "history@local");
-    await git.addConfig("user.name", "History");
-
-    const gitignorePath = path.join(userDir, ".gitignore");
-    await fs.writeFile(gitignorePath, GITIGNORE_CONTENT);
-
-    await git.add(".gitignore");
-    await git.commit("[init] Initialize note history");
-  }
-};
-
-export const commitCategoryRename = async (
+const _readableNote = async (
+  noteUuid: string,
   username: string,
-  oldPath: string,
-  newPath: string,
-): Promise<HistoryResult<string>> => {
-  const enabled = await _isHistoryEnabled();
-  if (!enabled) {
-    return { success: false };
-  }
-  const userDir = USER_NOTES_DIR(username);
-  const lockPath = path.join(userDir, ".historylock");
-  try {
-    await fs.access(userDir);
-  } catch {
-    return { success: false, error: "User directory not found" };
-  }
-  await ensureRepo(username);
-  try {
-    await fs.writeFile(lockPath, "", { flag: "a" });
-  } catch {
-    return { success: false, error: "Failed to create lock file" };
-  }
-  try {
-    await lock(lockPath, {
-      stale: 30000,
-      retries: { retries: 5, factor: 2, minTimeout: 100, maxTimeout: 2000 },
-    });
-    const git = _getGitInstance(userDir);
-    const oldPathNorm = oldPath.replace(/\\/g, "/");
-    const newPathNorm = newPath.replace(/\\/g, "/");
-    await git.add(["-u", oldPathNorm]);
-    await git.add(newPathNorm);
-    await git.commit(`[move] Category: ${oldPathNorm} -> ${newPathNorm}`);
-    return { success: true };
-  } catch (error) {
-    console.error("Git category rename error:", error);
-    return { success: false, error: String(error) };
-  } finally {
-    try {
-      await unlock(lockPath);
-    } catch {}
-  }
-};
+  permission: PermissionTypes,
+): Promise<string | null> => {
+  const filePath = await reachableFile(
+    noteUuid,
+    ItemTypes.NOTE,
+    username,
+    permission,
+  );
 
-export const commitNote = async (
-  username: string,
-  relativePath: string,
-  action: HistoryAction,
-  noteTitle: string,
-  metadata?: { oldTitle?: string; oldCategory?: string; newCategory?: string; oldPath?: string }
-): Promise<HistoryResult<string>> => {
-  const enabled = await _isHistoryEnabled();
-  if (!enabled) {
-    return { success: true };
-  }
-
-  const userDir = USER_NOTES_DIR(username);
-  const lockPath = path.join(userDir, ".historylock");
-
-  try {
-    await fs.access(userDir);
-  } catch {
-    return { success: false, error: "User directory not found" };
-  }
-
-  await ensureRepo(username);
-
-  try {
-    await fs.writeFile(lockPath, "", { flag: "a" });
-  } catch {
-    return { success: false, error: "Failed to create lock file" };
-  }
-
-  try {
-    await lock(lockPath, {
-      stale: 30000,
-      retries: {
-        retries: 5,
-        factor: 2,
-        minTimeout: 100,
-        maxTimeout: 2000,
-      },
-    });
-
-    const git = _getGitInstance(userDir);
-    const message = _formatCommitMessage(action, noteTitle, metadata);
-
-    const status = await git.status();
-    const normalizedPath = relativePath.replace(/\\/g, "/");
-
-    if (action === "delete") {
-      const hasDeletedFile = status.deleted.some(
-        (f) => f === normalizedPath || f.endsWith(path.basename(relativePath))
-      );
-      if (!hasDeletedFile) {
-        return { success: true };
-      }
-      await git.add(["-u", relativePath]);
-    } else if (action === "move" && metadata?.oldPath) {
-      const oldPathNormalized = metadata.oldPath.replace(/\\/g, "/");
-
-      try {
-        const oldFileExists = status.files.some(
-          (f) => f.path === oldPathNormalized || f.path === metadata.oldPath
-        );
-
-        if (oldFileExists) {
-          await git.mv(metadata.oldPath, relativePath);
-        } else {
-          await git.add(relativePath);
-        }
-      } catch (error) {
-        console.warn("Git mv failed, falling back to add:", error);
-        await git.add(relativePath);
-      }
-    } else {
-      const hasChanges = status.files.some(
-        (f) =>
-          f.path === relativePath ||
-          f.path === normalizedPath ||
-          f.path.endsWith(path.basename(relativePath))
-      );
-
-      if (!hasChanges) {
-        return { success: true };
-      }
-
-      await git.add(relativePath);
-    }
-
-    const result = await git.commit(message);
-    return { success: true, data: result.commit };
-  } catch (error) {
-    console.error("Git commit error:", error);
-    return { success: false, error: String(error) };
-  } finally {
-    try {
-      await unlock(lockPath);
-    } catch { }
-  }
+  return filePath ? _ownerOf(filePath) : null;
 };
 
 export const getHistory = async (
   noteUuid: string,
-  noteId: string,
-  noteCategory: string,
-  noteOwner: string,
+  _noteOwner: string,
   page: number = 1,
   pageSize: number = 20
 ): Promise<HistoryResult<{ entries: HistoryEntry[]; hasMore: boolean }>> => {
-  const enabled = await _isHistoryEnabled();
+  const enabled = await historyEnabled();
   if (!enabled) {
     return { success: false, error: "History is not enabled" };
   }
@@ -278,27 +57,23 @@ export const getHistory = async (
     return { success: false, error: "Not authenticated" };
   }
 
-  const canRead = await checkUserPermission(
+  const username = await _readableNote(
     noteUuid,
-    noteCategory || "Uncategorized",
-    "note",
     currentUser.username,
-    PermissionTypes.READ
+    PermissionTypes.READ,
   );
 
-  if (!canRead) {
+  if (!username) {
     return { success: false, error: "Permission denied" };
   }
-
-  const username = noteOwner || currentUser.username;
-  const userDir = USER_NOTES_DIR(username);
+  const userDir = notesRepoDir(username);
 
   try {
     await ensureRepo(username);
-    const git = _getGitInstance(userDir);
+    const git = repoGit(userDir);
 
-    const { getNoteById } = await import("@/app/_server/actions/note");
-    const note = await getNoteById(noteUuid, undefined, username);
+    const { getNoteById } = await import("@/app/_server/actions/note/queries");
+    const note = await getNoteById(noteUuid, username);
 
     if (!note) {
       return { success: false, error: "Note not found" };
@@ -338,7 +113,7 @@ export const getHistory = async (
     const entries: HistoryEntry[] = parsedEntries
       .slice(0, pageSize)
       .map((entry) => {
-        const parsed = _parseCommitMessage(entry.message);
+        const parsed = parseCommit(entry.message);
         return {
           commitHash: entry.hash,
           date: entry.date,
@@ -356,12 +131,10 @@ export const getHistory = async (
 
 export const getVersion = async (
   noteUuid: string,
-  noteId: string,
-  noteCategory: string,
-  noteOwner: string,
+  _noteOwner: string,
   commitHash: string
 ): Promise<HistoryResult<HistoryVersion>> => {
-  const enabled = await _isHistoryEnabled();
+  const enabled = await historyEnabled();
   if (!enabled) {
     return { success: false, error: "History is not enabled" };
   }
@@ -375,23 +148,25 @@ export const getVersion = async (
     return { success: false, error: "Invalid commit hash" };
   }
 
-  const canRead = await checkUserPermission(
+  const username = await _readableNote(
     noteUuid,
-    noteCategory || "Uncategorized",
-    "note",
     currentUser.username,
-    PermissionTypes.READ
+    PermissionTypes.READ,
   );
 
-  if (!canRead) {
+  if (!username) {
     return { success: false, error: "Permission denied" };
   }
-
-  const username = noteOwner || currentUser.username;
-  const userDir = USER_NOTES_DIR(username);
+  const userDir = notesRepoDir(username);
 
   try {
-    const git = _getGitInstance(userDir);
+    const git = repoGit(userDir);
+
+    const { extractYamlMetadata } = await import(
+      "@/app/_utils/yaml-metadata-utils"
+    );
+
+    let content: string | null = null;
 
     const filesInCommit = await git.raw([
       "ls-tree",
@@ -405,17 +180,12 @@ export const getVersion = async (
       .split("\n")
       .filter((f) => f.endsWith(".md") && f.length > 0);
 
-    const { extractYamlMetadata } = await import(
-      "@/app/_utils/yaml-metadata-utils"
-    );
-
-    let historicalPath: string | null = null;
     for (const file of mdFiles) {
       try {
         const fileContent = await git.show([`${commitHash}:${file}`]);
         const { metadata } = extractYamlMetadata(fileContent);
         if (metadata.uuid === noteUuid) {
-          historicalPath = file;
+          content = fileContent;
           break;
         }
       } catch {
@@ -423,11 +193,33 @@ export const getVersion = async (
       }
     }
 
-    if (!historicalPath) {
+    if (content === null) {
+      const { getNoteById } = await import("@/app/_server/actions/note/queries");
+      const note = await getNoteById(noteUuid, username);
+
+      if (note) {
+        const currentPath = path.join(
+          note.category || "Uncategorized",
+          `${note.id}.md`
+        );
+
+        try {
+          const atPath = await git.show([`${commitHash}:${currentPath}`]);
+          const { metadata } = extractYamlMetadata(atPath);
+          if (!metadata.uuid) content = atPath;
+        } catch (error) {
+          console.warn(
+            "Note is not at its current path in that commit:",
+            error
+          );
+        }
+      }
+    }
+
+    if (content === null) {
       return { success: false, error: "Note version not found in commit" };
     }
 
-    const content = await git.show([`${commitHash}:${historicalPath}`]);
     const { metadata, contentWithoutMetadata } = extractYamlMetadata(content);
 
     const log = await git.log({
@@ -446,7 +238,7 @@ export const getVersion = async (
         commitHash,
         date: commitDate,
         content: contentWithoutMetadata,
-        title: metadata.title || noteId,
+        title: metadata.title || "Untitled",
       },
     };
   } catch (error) {
@@ -456,12 +248,10 @@ export const getVersion = async (
 
 export const restoreNoteVersion = async (
   noteUuid: string,
-  noteId: string,
-  noteCategory: string,
-  noteOwner: string,
+  _noteOwner: string,
   commitHash: string
 ): Promise<HistoryResult<void>> => {
-  const enabled = await _isHistoryEnabled();
+  const enabled = await historyEnabled();
   if (!enabled) {
     return { success: false, error: "History is not enabled" };
   }
@@ -475,25 +265,17 @@ export const restoreNoteVersion = async (
     return { success: false, error: "Invalid commit hash" };
   }
 
-  const canEdit = await checkUserPermission(
-    noteId,
-    noteCategory || "Uncategorized",
-    "note",
+  const owner = await _readableNote(
+    noteUuid,
     currentUser.username,
-    PermissionTypes.EDIT
+    PermissionTypes.EDIT,
   );
 
-  if (!canEdit) {
+  if (!owner) {
     return { success: false, error: "Permission denied" };
   }
 
-  const versionResult = await getVersion(
-    noteUuid,
-    noteId,
-    noteCategory,
-    noteOwner,
-    commitHash
-  );
+  const versionResult = await getVersion(noteUuid, owner, commitHash);
 
   if (!versionResult.success || !versionResult.data) {
     return { success: false, error: versionResult.error };
@@ -502,12 +284,9 @@ export const restoreNoteVersion = async (
   const { updateNote } = await import("@/app/_server/actions/note");
 
   const formData = new FormData();
-  formData.append("id", noteId);
-  formData.append("uuid", noteUuid || "");
+  formData.append("uuid", noteUuid);
   formData.append("title", versionResult.data.title);
   formData.append("content", versionResult.data.content);
-  formData.append("category", noteCategory || "Uncategorized");
-  formData.append("originalCategory", noteCategory || "Uncategorized");
 
   const result = await updateNote(formData);
 
@@ -529,16 +308,20 @@ export const deleteAllRepos = async (): Promise<HistoryResult<void>> => {
     const dataDir = path.join(process.cwd(), "data", NOTES_FOLDER);
 
     for (const user of users) {
-      const userGitDir = path.join(dataDir, user.username, ".git");
-      const userLockFile = path.join(dataDir, user.username, ".historylock");
-      const userGitignore = path.join(dataDir, user.username, ".gitignore");
+      const userDir = path.join(dataDir, user.username);
+      const userGitDir = path.join(userDir, ".git");
+      const userLockFile = historyLockPath(user.username);
+      const userGitignore = path.join(userDir, ".gitignore");
 
       try {
         await fs.rm(userGitDir, { recursive: true, force: true });
       } catch { }
 
+      await dropLegacyLock(userDir);
+
       try {
-        await fs.unlink(userLockFile);
+        await fs.rm(`${userLockFile}.lock`, { recursive: true, force: true });
+        await fs.rm(userLockFile, { force: true });
       } catch { }
 
       try {

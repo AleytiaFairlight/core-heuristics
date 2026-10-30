@@ -1,10 +1,11 @@
 "use client";
 
+import { LockedItemNotice } from "@/app/_components/GlobalComponents/Feedback/LockedItemNotice";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { Category, Checklist, SanitisedUser } from "@/app/_types";
 import { ChecklistView } from "@/app/_components/FeatureComponents/Checklists/Checklist";
-import { KanbanBoard } from "@/app/_components/FeatureComponents/Checklists/Parts/Kanban/KanbanBoard";
+import { Kanban } from "@/app/_components/FeatureComponents/Kanban/Kanban";
 import { ChecklistHeader } from "@/app/_components/FeatureComponents/Checklists/Parts/Common/ChecklistHeader";
 import { ShareModal } from "@/app/_components/GlobalComponents/Modals/SharingModals/ShareModal";
 import { ConfirmModal } from "@/app/_components/GlobalComponents/Modals/ConfirmationModals/ConfirmModal";
@@ -15,11 +16,13 @@ import { CloneCategoryModal } from "@/app/_components/GlobalComponents/Modals/Co
 import { useNavigationGuard } from "@/app/_providers/NavigationGuardProvider";
 import { Layout } from "@/app/_components/GlobalComponents/Layout/Layout";
 import { useChecklist } from "@/app/_hooks/useChecklist";
-import { Modes } from "@/app/_types/enums";
+import { isKanbanType, Modes } from "@/app/_types/enums";
 import { useShortcut } from "@/app/_providers/ShortcutsProvider";
 import { toggleArchive } from "@/app/_server/actions/dashboard";
-import { buildCategoryPath } from "@/app/_utils/global-utils";
+import { itemHref } from "@/app/_utils/global-utils";
+import { ItemTypes } from "@/app/_types/enums";
 import { useTranslations } from "next-intl";
+import { useReturnPath } from "@/app/_hooks/useReturnPath";
 
 interface ChecklistClientProps {
   checklist: Checklist;
@@ -47,6 +50,7 @@ export const ChecklistClient = ({
     useState<string>("");
   const { openCreateChecklistModal, openCreateCategoryModal, openSettings } =
     useShortcut();
+  const returnPath = useReturnPath(`/?mode=${Modes.CHECKLISTS}`);
   const prevChecklistId = useRef(checklist.id);
   const prevUpdatedAt = useRef(checklist.updatedAt);
 
@@ -67,13 +71,14 @@ export const ChecklistClient = ({
 
   const handleBack = () => {
     checkNavigation(() => {
-      router.push("/?mode=checklists");
+      router.push(returnPath);
     });
   };
 
   const handleArchive = async () => {
     const result = await toggleArchive(localChecklist, Modes.CHECKLISTS);
     if (result.success) {
+      handleBack();
       router.refresh();
     }
   };
@@ -84,11 +89,7 @@ export const ChecklistClient = ({
 
   const handleCloneConfirm = async (targetCategory: string) => {
     const formData = new FormData();
-    formData.append("id", localChecklist.id);
-    formData.append(
-      "originalCategory",
-      localChecklist.category || "Uncategorized",
-    );
+    formData.append("uuid", localChecklist.uuid || "");
     formData.append("category", targetCategory || "Uncategorized");
     if (localChecklist.owner) {
       formData.append("user", localChecklist.owner);
@@ -97,13 +98,8 @@ export const ChecklistClient = ({
     const { cloneChecklist } = await import("@/app/_server/actions/checklist");
     const result = await cloneChecklist(formData);
 
-    if (result.success && result.data) {
-      router.push(
-        `/checklist/${buildCategoryPath(
-          result.data.category || "Uncategorized",
-          result.data.id,
-        )}`,
-      );
+    if (result.success && result.data?.uuid) {
+      router.push(itemHref(ItemTypes.CHECKLIST, result.data.uuid));
       router.refresh();
     }
   };
@@ -114,7 +110,7 @@ export const ChecklistClient = ({
 
   const handleDelete = (deletedId: string) => {
     checkNavigation(() => {
-      router.push("/?mode=checklists");
+      router.push(returnPath);
     });
   };
 
@@ -123,7 +119,7 @@ export const ChecklistClient = ({
     getNewType,
     handleConfirmConversion,
     sensors,
-    DeleteModal,
+    deleteModal,
   } = useChecklist({
     list: localChecklist,
     onUpdate: handleUpdate,
@@ -131,9 +127,9 @@ export const ChecklistClient = ({
   });
 
   const renderContent = () => {
-    if (localChecklist.type === "task") {
+    if (isKanbanType(localChecklist.type)) {
       return (
-        <div className="h-full flex flex-col bg-background">
+        <div className="h-full flex flex-col bg-background min-w-0">
           <ChecklistHeader
             checklist={localChecklist}
             onBack={handleBack}
@@ -144,7 +140,7 @@ export const ChecklistClient = ({
             onArchive={handleArchive}
             onClone={handleClone}
           />
-          <KanbanBoard checklist={localChecklist} onUpdate={handleUpdate} />
+          <Kanban checklist={localChecklist} onUpdate={handleUpdate} />
         </div>
       );
     }
@@ -171,6 +167,11 @@ export const ChecklistClient = ({
       user={user}
       extraClasses="jotty-checklist-page"
     >
+      <LockedItemNotice
+        uuid={localChecklist.uuid}
+        itemType={ItemTypes.CHECKLIST}
+        lockReason={localChecklist.lockReason}
+      />
       {renderContent()}
 
       {showShareModal && (
@@ -193,11 +194,11 @@ export const ChecklistClient = ({
             currentType:
               localChecklist.type === "simple"
                 ? t("checklists.simpleChecklist")
-                : t("checklists.taskProject"),
+                : t("checklists.kanbanBoard"),
             newType:
               getNewType(localChecklist.type) === "simple"
                 ? t("checklists.simpleChecklist")
-                : t("checklists.taskProject"),
+                : t("checklists.kanbanBoard"),
           })}
           confirmText={t("checklists.convert")}
         />
@@ -219,8 +220,8 @@ export const ChecklistClient = ({
         <CreateListModal
           onClose={() => setShowCreateModal(false)}
           onCreated={(newChecklist) => {
-            if (newChecklist) {
-              router.push(`/checklist/${newChecklist.id}`);
+            if (newChecklist?.uuid) {
+              router.push(itemHref(ItemTypes.CHECKLIST, newChecklist.uuid));
             }
             setShowCreateModal(false);
             router.refresh();
@@ -247,7 +248,7 @@ export const ChecklistClient = ({
         />
       )}
 
-      <DeleteModal />
+      {deleteModal}
       {showCloneModal && (
         <CloneCategoryModal
           isOpen={showCloneModal}

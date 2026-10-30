@@ -10,4 +10,5 @@ export interface SharingPermissions {
   canRead: boolean;
   canEdit: boolean;
   canDelete: boolean;
+  canCreate?: boolean;
 }

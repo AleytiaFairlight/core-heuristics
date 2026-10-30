@@ -5,6 +5,11 @@ export enum Modes {
   DEPRECATED_DOCS = "docs",
 }
 
+export enum ToggleState {
+  ENABLE = "enable",
+  DISABLE = "disable",
+}
+
 export enum ItemTypes {
   CHECKLIST = "checklist",
   NOTE = "note",
@@ -13,6 +18,28 @@ export enum ItemTypes {
 export enum ChecklistsTypes {
   SIMPLE = "simple",
   TASK = "task",
+  KANBAN = "kanban",
+}
+
+/**
+ * @fccview here, we need to @deprecate "task" eventually, it's unused in all create/edit operations but it's still used
+ * in read operation for backward compatibility with old kanban data.
+ */
+export const isKanbanType = (type?: string): boolean =>
+  type === "kanban" || type === "task";
+
+export enum KanbanPriorityLevel {
+  CRITICAL = "critical",
+  HIGH = "high",
+  MEDIUM = "medium",
+  LOW = "low",
+  NONE = "none",
+}
+
+export enum KanbanCardPane {
+  TASK = "task",
+  DETAILS = "details",
+  COMMENTS = "comments",
 }
 
 export enum TaskStatus {
@@ -33,6 +60,25 @@ export enum PermissionTypes {
   READ = "canRead",
   EDIT = "canEdit",
   DELETE = "canDelete",
+  CREATE = "canCreate",
+}
+
+export enum NotificationTargets {
+  CHECKLIST = "checklist",
+  NOTE = "note",
+  CHECKLIST_CATEGORY = "checklist-category",
+  NOTE_CATEGORY = "note-category",
+}
+
+export enum SharePerms {
+  READ = "r",
+  WRITE = "rw",
+  DELETE = "rwd",
+}
+
+export enum ShareScope {
+  FILE = "file",
+  CATEGORY = "category",
 }
 
 export enum AdminTabs {
@@ -54,4 +100,31 @@ export enum ProfileTabs {
   ENCRYPTION = "encryption",
   USER_PREFERENCES = "userPreferences",
   AUDIT_LOGS = "audit_logs",
+}
+
+export enum BottomBarSpaces {
+  QUICK_NAV = "--jotty-quick-nav-space",
+  NOTE_BAR = "--jotty-note-bar-space",
+}
+
+export enum DropPosition {
+  BEFORE = "before",
+  AFTER = "after",
+}
+
+export enum CardPlacement {
+  TOP = "top",
+  BOTTOM = "bottom",
+}
+
+export enum ItemSort {
+  ALPHABETICAL = "alphabetical",
+  SHUFFLE = "shuffle",
+  CREATED = "created",
+  MODIFIED = "modified",
+}
+
+export enum SortDirection {
+  ASC = "asc",
+  DESC = "desc",
 }

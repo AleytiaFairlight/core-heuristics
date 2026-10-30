@@ -1,12 +1,22 @@
+import { StampRefusals } from "@/app/_consts/identity";
 import { ItemTypes } from "./enums";
+import { SharingPermissions } from "./core";
 
-export type ChecklistType = "simple" | "task";
+export type ChecklistType = "simple" | "task" | "kanban";
+
+export type KanbanPriority = "critical" | "high" | "medium" | "low" | "none";
+
+export interface KanbanReminder {
+  datetime: string;
+  notified?: boolean;
+}
 
 export interface TimeEntry {
   id: string;
   startTime: string;
   endTime?: string;
   duration?: number;
+  user?: string;
 }
 
 export interface RecurrenceRule {
@@ -31,6 +41,15 @@ export interface KanbanStatus {
   autoComplete?: boolean;
 }
 
+export interface Comment {
+  id: string;
+  author: string;
+  text: string;
+  createdAt: string;
+  updatedAt?: string;
+  parentId?: string | null;
+}
+
 export interface Item {
   id: string;
   category?: string;
@@ -40,6 +59,7 @@ export interface Item {
   status?: string;
   timeEntries?: TimeEntry[];
   estimatedTime?: number;
+  startDate?: string;
   targetDate?: string;
   children?: Item[];
   createdBy?: string;
@@ -53,6 +73,51 @@ export interface Item {
   archivedAt?: string;
   archivedBy?: string;
   previousStatus?: string;
+  priority?: KanbanPriority;
+  score?: number;
+  assignee?: string;
+  agent?: string;
+  reminder?: KanbanReminder;
+  externalId?: string;
+}
+
+export interface ItemStub {
+  id: string;
+  text: string;
+  priority?: KanbanPriority;
+}
+
+export interface TickCell {
+  key: string;
+  label: string;
+  done: number;
+  size: number;
+}
+
+export interface ListTicks {
+  bucket: number;
+  cells: TickCell[];
+}
+
+export interface MiniColumn {
+  status: KanbanStatus;
+  count: number;
+  top: ItemStub[];
+}
+
+export interface ListSummary {
+  total: number;
+  completed: number;
+  isFinished: boolean;
+  hasTodo: boolean;
+  hasInProgress: boolean;
+  cards: number;
+  inProgress: number;
+  ticks: ListTicks;
+  open: ItemStub[];
+  columns: MiniColumn[];
+  assignees: string[];
+  seconds: number;
 }
 
 export interface List {
@@ -63,8 +128,9 @@ export interface List {
 }
 
 export interface Checklist {
+  /** @deprecated file-layer slug (on-disk filename), never identity; use uuid */
   id: string;
-  uuid?: string;
+  uuid: string;
   title: string;
   type: ChecklistType;
   category?: string;
@@ -73,9 +139,17 @@ export interface Checklist {
   updatedAt: string;
   owner?: string;
   isShared?: boolean;
+  sharedWith?: string | string[];
+  sharedFrom?: string;
+  permissions?: SharingPermissions;
+  isLoose?: boolean;
   itemType?: ItemTypes;
   isDeleted?: boolean;
   rawContent?: string;
   statuses?: KanbanStatus[];
   tags?: string[];
+  specNote?: string;
+  extraMetadata?: Record<string, unknown>;
+  lockReason?: StampRefusals;
+  summary?: ListSummary;
 }

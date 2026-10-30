@@ -10,12 +10,12 @@ import {
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
-import { Checklist, Item, RecurrenceRule } from "@/app/_types";
+import { Checklist, ChecklistType, Item, RecurrenceRule, Result } from "@/app/_types";
 import {
-  deleteList,
   convertChecklistType,
-  getListById,
+  viewList,
 } from "@/app/_server/actions/checklist";
+import { runListDelete } from "@/app/_hooks/lib/delete-list";
 import {
   createItem,
   updateItem,
@@ -24,16 +24,85 @@ import {
   bulkToggleItems,
   bulkDeleteItems,
   createSubItem,
+  sortItems,
+  undoSort,
 } from "@/app/_server/actions/checklist-item";
 import { useRouter } from "next/navigation";
-import {
-  getCurrentUser,
-  getUserByChecklist,
-} from "@/app/_server/actions/users";
+import { getUsername } from "@/app/_server/actions/users";
 import { copyTextToClipboard } from "../_utils/global-utils";
-import { encodeCategoryPath } from "../_utils/global-utils";
 import { areAllItemsCompleted } from "../_utils/checklist-utils";
+import {
+  SortedList,
+  preorderIds,
+  restoreTree,
+  sameOrder,
+  treeShape,
+} from "@/app/_utils/checklist-sort-utils";
+import { ItemSort, SortDirection } from "@/app/_types/enums";
 import { ConfirmModal } from "@/app/_components/GlobalComponents/Modals/ConfirmationModals/ConfirmModal";
+import { useToast } from "@/app/_providers/ToastProvider";
+
+const SORT_UNDO_LIMIT = 20;
+
+const TOGGLE_ATTEMPTS = 3;
+
+interface SortUndo {
+  before: string[];
+  after: string[];
+}
+
+const _setAll = (items: Item[], completed: boolean): Item[] =>
+  items.map((item) => ({
+    ...item,
+    completed,
+    children: item.children ? _setAll(item.children, completed) : undefined,
+  }));
+
+const _toggleTree = (
+  items: Item[],
+  itemId: string,
+  updates: Partial<Item>
+): Item[] =>
+  items.map((item) => {
+    if (item.id === itemId) {
+      const updated = { ...item, ...updates };
+      if (item.children?.length && updates.completed !== undefined) {
+        updated.children = _setAll(item.children, updates.completed);
+      }
+      return updated;
+    }
+
+    if (!item.children?.length) return item;
+
+    const children = _toggleTree(item.children, itemId, updates);
+    return { ...item, children, completed: areAllItemsCompleted(children) };
+  });
+
+const _findItem = (items: Item[], itemId: string): Item | undefined => {
+  for (const item of items) {
+    if (item.id === itemId) return item;
+    const found = item.children && _findItem(item.children, itemId);
+    if (found) return found;
+  }
+  return undefined;
+};
+
+const _withToggles = (
+  list: Checklist,
+  toggles: Map<string, boolean>
+): Checklist => {
+  const owed = Array.from(toggles).filter(([itemId, completed]) => {
+    const item = _findItem(list.items, itemId);
+    return item !== undefined && item.completed !== completed;
+  });
+  if (owed.length === 0) return list;
+
+  const items = owed.reduce(
+    (tree, [itemId, completed]) => _toggleTree(tree, itemId, { completed }),
+    list.items
+  );
+  return { ...list, items };
+};
 
 interface UseChecklistProps {
   list: Checklist;
@@ -48,6 +117,7 @@ export const useChecklist = ({
 }: UseChecklistProps) => {
   const t = useTranslations();
   const router = useRouter();
+  const { showToast } = useToast();
   const [isLoading, setIsLoading] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
   const [showBulkPasteModal, setShowBulkPasteModal] = useState(false);
@@ -57,10 +127,15 @@ export const useChecklist = ({
   const [focusKey, setFocusKey] = useState(0);
   const [copied, setCopied] = useState(false);
   const [itemsToDelete, setItemsToDelete] = useState<string[]>([]);
+  const [sortUndos, setSortUndos] = useState<SortUndo[]>([]);
   const [pendingToggles, setPendingToggles] = useState<Map<string, boolean>>(
     new Map()
   );
+  const [sendingToggles, setSendingToggles] = useState(0);
   const isInitialMount = useRef(true);
+  const pushedList = useRef<Checklist | null>(null);
+  const unsyncedToggles = useRef(new Map<string, boolean>());
+  const toggleFailures = useRef(new Map<string, number>());
 
   const sensors = useSensors(
     useSensor(PointerSensor, {
@@ -80,7 +155,8 @@ export const useChecklist = ({
   );
 
   useEffect(() => {
-    setLocalList(list);
+    if (list === pushedList.current) return;
+    setLocalList(_withToggles(list, unsyncedToggles.current));
   }, [list]);
 
   useEffect(() => {
@@ -88,6 +164,7 @@ export const useChecklist = ({
       isInitialMount.current = false;
       return;
     }
+    pushedList.current = localList;
     onUpdate(localList);
   }, [localList, onUpdate]);
 
@@ -100,9 +177,8 @@ export const useChecklist = ({
       const idsToProcess = [...itemsToDelete];
 
       const formData = new FormData();
-      formData.append("listId", localList.id);
+      formData.append("uuid", localList.uuid || "");
       formData.append("itemIds", JSON.stringify(idsToProcess));
-      formData.append("category", localList.category || "Uncategorized");
 
       try {
         const result = await bulkDeleteItems(formData);
@@ -118,7 +194,7 @@ export const useChecklist = ({
     }, 1000);
 
     return () => clearTimeout(timer);
-  }, [itemsToDelete, localList.id, localList.category, router]);
+  }, [itemsToDelete, localList.uuid, router]);
 
   useEffect(() => {
     if (pendingToggles.size === 0) {
@@ -127,16 +203,22 @@ export const useChecklist = ({
 
     const timer = setTimeout(async () => {
       const togglesToProcess = new Map(pendingToggles);
+      setSendingToggles((count) => count + togglesToProcess.size);
       setPendingToggles(new Map());
+
+      const settle = (itemId: string, completed: boolean) => {
+        toggleFailures.current.delete(itemId);
+        if (unsyncedToggles.current.get(itemId) === completed) {
+          unsyncedToggles.current.delete(itemId);
+        }
+      };
 
       const syncPromises = Array.from(togglesToProcess.entries()).map(
         async ([itemId, completed]) => {
           try {
             const formData = new FormData();
-            formData.append("listId", localList.id);
             formData.append("itemId", itemId);
             formData.append("completed", String(completed));
-            formData.append("category", localList.category || "Uncategorized");
 
             const result = await updateItem(
               localList,
@@ -147,20 +229,43 @@ export const useChecklist = ({
             if (!result.success) {
               throw new Error("Server action failed");
             }
+            settle(itemId, completed);
+            return true;
           } catch (error) {
             console.error(`Failed to sync toggle for ${itemId}:`, error);
-            setPendingToggles((prev) => new Map(prev).set(itemId, completed));
+            const failures = (toggleFailures.current.get(itemId) ?? 0) + 1;
+            if (failures >= TOGGLE_ATTEMPTS) {
+              settle(itemId, completed);
+              return false;
+            }
+            toggleFailures.current.set(itemId, failures);
+            setPendingToggles((prev) =>
+              prev.has(itemId) ? prev : new Map(prev).set(itemId, completed)
+            );
+            return true;
+          } finally {
+            setSendingToggles((count) => count - 1);
           }
         }
       );
 
-      await Promise.all(syncPromises);
+      const synced = await Promise.all(syncPromises);
+
+      if (synced.includes(false)) {
+        showToast({
+          type: "error",
+          title: t("common.error"),
+          message: t("checklists.toggleFailed"),
+        });
+        const fresh = await viewList(localList.uuid || "");
+        if (fresh) setLocalList(_withToggles(fresh, unsyncedToggles.current));
+      }
 
       router.refresh();
     }, 500);
 
     return () => clearTimeout(timer);
-  }, [pendingToggles, localList.id, localList.category, localList]);
+  }, [pendingToggles, localList, router, showToast, t]);
 
   const handleDeleteItem = (itemId: string) => {
     setLocalList((currentList) => {
@@ -197,154 +302,45 @@ export const useChecklist = ({
   };
 
   const confirmDeleteList = async () => {
-    const formData = new FormData();
-    formData.append("id", localList.id);
-    formData.append("category", localList.category || "Uncategorized");
-    if (localList.uuid) formData.append("uuid", localList.uuid);
-    await deleteList(formData);
-    onDelete?.(localList.id);
+    const outcome = await runListDelete(localList.uuid || "");
+
+    if (!outcome.ok) {
+      showToast({
+        type: "error",
+        title: t("common.error"),
+        message: outcome.error || t("common.error"),
+      });
+      return;
+    }
+
+    onDelete?.(localList.uuid || "");
     setShowDeleteModal(false);
-  };
-
-  const findItemById = (items: any[], itemId: string): any | null => {
-    for (const item of items) {
-      if (item.id === itemId) {
-        return item;
-      }
-
-      if (item.children && item.children.length > 0) {
-        const found = findItemById(item.children, itemId);
-        if (found) {
-          return found;
-        }
-      }
-    }
-    return null;
-  };
-
-  const findParentAndSiblings = (
-    items: any[],
-    itemId: string,
-    parent: any = null,
-    siblings: any[] = []
-  ): { parent: any | null; siblings: any[] } | null => {
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-
-      if (item.id === itemId) {
-        return { parent, siblings: items };
-      }
-
-      if (item.children && item.children.length > 0) {
-        const result = findParentAndSiblings(
-          item.children,
-          itemId,
-          item,
-          item.children
-        );
-        if (result) {
-          return result;
-        }
-      }
-    }
-    return null;
-  };
-
-  const updateAllChildren = (items: any[], completed: boolean): any[] => {
-    return items.map((item) => ({
-      ...item,
-      completed,
-      children: item.children
-        ? updateAllChildren(item.children, completed)
-        : undefined,
-    }));
-  };
-
-  const updateParentBasedOnChildren = (parent: any): any => {
-    if (!parent || (parent.children || []).length < 1) {
-      return parent;
-    }
-
-    return {
-      ...parent,
-      completed: areAllItemsCompleted(parent.children),
-    };
   };
 
   const handleToggleItem = async (itemId: string, completed: boolean) => {
     const now = new Date().toISOString();
-    const currentUser = await getCurrentUser();
+    const username = (await getUsername()) || undefined;
 
-    setLocalList((currentList) => {
-      const findAndUpdateItem = (
-        items: any[],
-        itemId: string,
-        updates: any
-      ): any[] => {
-        return items.map((item) => {
-          if (item.id === itemId) {
-            let updatedItem = { ...item, ...updates };
-
-            if (
-              updates.completed &&
-              item.children &&
-              item.children.length > 0
-            ) {
-              updatedItem.children = updateAllChildren(item.children, true);
-            } else if (
-              updates.completed === false &&
-              item.children &&
-              item.children.length > 0
-            ) {
-              updatedItem.children = updateAllChildren(item.children, false);
-            }
-
-            return updatedItem;
-          }
-
-          if (item.children && item.children.length > 0) {
-            const updatedChildren = findAndUpdateItem(
-              item.children,
-              itemId,
-              updates
-            );
-            const updatedItem = updateParentBasedOnChildren({
-              ...item,
-              children: updatedChildren,
-            });
-            return updatedItem;
-          }
-
-          return item;
-        });
-      };
-
-      const updatedItems = findAndUpdateItem(currentList.items, itemId, {
+    setLocalList((currentList) => ({
+      ...currentList,
+      items: _toggleTree(currentList.items, itemId, {
         completed,
-        ...(currentUser && {
-          lastModifiedBy: currentUser.username,
+        ...(username && {
+          lastModifiedBy: username,
           lastModifiedAt: now,
         }),
-      });
+      }),
+      updatedAt: now,
+    }));
 
-      return {
-        ...currentList,
-        items: updatedItems,
-        updatedAt: now,
-      };
-    });
-
+    unsyncedToggles.current.set(itemId, completed);
     setPendingToggles((prev) => new Map(prev).set(itemId, completed));
   };
 
   const handleEditItem = async (itemId: string, text: string) => {
     const formData = new FormData();
-    const currentUser = await getCurrentUser();
-    formData.append("listId", localList.id);
     formData.append("itemId", itemId);
     formData.append("text", text);
-    formData.append("category", localList.category || "Uncategorized");
-    formData.append("user", localList.owner || currentUser?.username || "");
 
     const result = await updateItem(localList, formData);
 
@@ -508,7 +504,7 @@ export const useChecklist = ({
           activeInfo.index < overInfo.index;
 
         const position = isDropIndicator
-          ? overId.startsWith("drop-after::")
+          ? overId.startsWith("drop-after")
             ? "after"
             : "before"
           : isDraggingDown
@@ -539,19 +535,18 @@ export const useChecklist = ({
       activeInfo.index < overInfo.index;
 
     const reorderPosition = isDropIndicator
-      ? overId.startsWith("drop-after::")
+      ? overId.startsWith("drop-after")
         ? "after"
         : "before"
       : isDraggingDown
       ? "after"
       : "before";
 
-    formData.append("listId", localList.id);
+    formData.append("uuid", localList.uuid || "");
     formData.append("activeItemId", activeId);
     formData.append("overItemId", targetItemId);
     formData.append("isDropInto", String(isDropInto));
     formData.append("position", reorderPosition);
-    formData.append("category", localList.category || "Uncategorized");
 
     const result = await reorderItems(formData);
     if (!result.success) {
@@ -562,9 +557,8 @@ export const useChecklist = ({
   const handleBulkPaste = async (itemsText: string) => {
     setIsLoading(true);
     const formData = new FormData();
-    formData.append("listId", localList.id);
+    formData.append("uuid", localList.uuid || "");
     formData.append("itemsText", itemsText);
-    formData.append("category", localList.category || "Uncategorized");
     const result = await createBulkItems(formData);
     setIsLoading(false);
 
@@ -577,17 +571,15 @@ export const useChecklist = ({
     setShowConversionModal(true);
   };
 
-  const getNewType = (currentType: "simple" | "task"): "simple" | "task" => {
-    return currentType === "simple" ? "task" : "simple";
+  const getNewType = (currentType: ChecklistType): ChecklistType => {
+    return currentType === "simple" ? "kanban" : "simple";
   };
 
   const handleConfirmConversion = async () => {
     setIsLoading(true);
     const newType = getNewType(localList.type);
     const formData = new FormData();
-    formData.append("listId", localList.id);
     formData.append("newType", newType);
-    formData.append("category", localList.category || "Uncategorized");
     formData.append("uuid", localList.uuid || "");
     const result = await convertChecklistType(formData);
     setIsLoading(false);
@@ -620,13 +612,12 @@ export const useChecklist = ({
 
     setIsLoading(true);
     const formData = new FormData();
-    formData.append("listId", localList.id);
+    formData.append("uuid", localList.uuid || "");
     formData.append("completed", String(completed));
     formData.append(
       "itemIds",
       JSON.stringify(targetItems.map((item) => item.id))
     );
-    formData.append("category", localList.category || "Uncategorized");
 
     const result = await bulkToggleItems(formData);
     setIsLoading(false);
@@ -640,8 +631,7 @@ export const useChecklist = ({
   const handleClearAll = async (type: "completed" | "incomplete") => {
     setIsLoading(true);
     const formData = new FormData();
-    formData.append("id", localList.id);
-    formData.append("category", localList.category || "Uncategorized");
+    formData.append("uuid", localList.uuid || "");
     formData.append("type", type);
     if (localList.owner) {
       formData.append("user", localList.owner);
@@ -661,6 +651,81 @@ export const useChecklist = ({
     }
   };
 
+  const pendingTogglesCount = pendingToggles.size + sendingToggles;
+
+  const isSyncing = itemsToDelete.length > 0 || pendingTogglesCount > 0;
+
+  const lastSort = sortUndos[sortUndos.length - 1];
+
+  const canUndoSort = useMemo(
+    () => Boolean(lastSort) && sameOrder(lastSort.after, treeShape(localList.items)),
+    [lastSort, localList.items]
+  );
+
+  const showSortError = (error?: string) =>
+    showToast({
+      type: "error",
+      title: t("common.error"),
+      message: error || t("checklists.sortFailed"),
+    });
+
+  const sendSort = async (
+    send: () => Promise<Result<SortedList>>,
+    onSorted: (sorted: SortedList) => void
+  ) => {
+    setIsLoading(true);
+    try {
+      const result = await send();
+      if (result.success && result.data) {
+        onSorted(result.data);
+        const order = preorderIds(result.data.list.items);
+        setLocalList((current) => ({
+          ...current,
+          items: restoreTree(current.items, order),
+        }));
+        return;
+      }
+      console.error("Sort was refused:", result.error);
+      showSortError(result.error);
+    } catch (error) {
+      console.error("Failed to sort items:", error);
+      showSortError();
+    } finally {
+      setIsLoading(false);
+      router.refresh();
+    }
+  };
+
+  const handleSort = async (sort: ItemSort, direction?: SortDirection) => {
+    if (isLoading || isSyncing) return;
+    const formData = new FormData();
+    formData.append("uuid", localList.uuid || "");
+    formData.append("sort", sort);
+    if (direction) formData.append("direction", direction);
+
+    await sendSort(
+      () => sortItems(formData),
+      ({ list: sorted, before, changed }) => {
+        if (!changed) return;
+        const undo = { before, after: treeShape(sorted.items) };
+        setSortUndos((undos) => [...undos, undo].slice(-SORT_UNDO_LIMIT));
+      }
+    );
+  };
+
+  const handleUndoSort = async () => {
+    if (!canUndoSort || isLoading || isSyncing) return;
+    const formData = new FormData();
+    formData.append("uuid", localList.uuid || "");
+    formData.append("before", JSON.stringify(lastSort.before));
+    formData.append("expected", JSON.stringify(lastSort.after));
+
+    await sendSort(
+      () => undoSort(formData),
+      () => setSortUndos((undos) => undos.slice(0, -1))
+    );
+  };
+
   const handleCreateItem = async (
     text: string,
     recurrence?: RecurrenceRule
@@ -668,21 +733,15 @@ export const useChecklist = ({
     setIsLoading(true);
     const formData = new FormData();
 
-    formData.append("listId", localList.id);
     formData.append("text", text);
-    formData.append("category", localList.category || "Uncategorized");
 
-    const currentUser = await getCurrentUser();
+    const username = (await getUsername()) || undefined;
     if (recurrence) {
       formData.append("recurrence", JSON.stringify(recurrence));
     }
-    const result = await createItem(localList, formData, currentUser?.username);
+    const result = await createItem(localList, formData, username);
 
-    const updatedList = await getListById(
-      localList.id,
-      localList.owner || currentUser?.username,
-      localList.category
-    );
+    const updatedList = await viewList(localList.uuid || "");
 
     if (updatedList) {
       setLocalList(updatedList);
@@ -700,10 +759,9 @@ export const useChecklist = ({
   const handleAddSubItem = async (parentId: string, text: string) => {
     setIsLoading(true);
     const formData = new FormData();
-    formData.append("listId", localList.id);
+    formData.append("uuid", localList.uuid || "");
     formData.append("parentId", parentId);
     formData.append("text", text);
-    formData.append("category", localList.category || "Uncategorized");
     const result = await createSubItem(formData);
     setIsLoading(false);
 
@@ -742,7 +800,7 @@ export const useChecklist = ({
         setLocalList((currentList) => ({
           ...currentList,
           items: updateItemWithSubItem(currentList.items, parentId, {
-            id: `${localList.id}-sub-${Date.now()}`,
+            id: `${localList.uuid}-sub-${Date.now()}`,
             text,
             completed: false,
             order: 0,
@@ -754,15 +812,7 @@ export const useChecklist = ({
   };
 
   const handleCopyId = async () => {
-    const success = await copyTextToClipboard(
-      `${
-        localList.uuid
-          ? localList.uuid
-          : `${encodeCategoryPath(localList.category || "Uncategorized")}/${
-              localList.id
-            }`
-      }`
-    );
+    const success = await copyTextToClipboard(localList.uuid || "");
     if (success) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
@@ -819,6 +869,10 @@ export const useChecklist = ({
     handleConfirmConversion,
     handleBulkToggle,
     handleClearAll,
+    handleSort,
+    handleUndoSort,
+    canUndoSort,
+    isSyncing,
     handleCreateItem,
     handleAddSubItem,
     handleCopyId,
@@ -826,9 +880,9 @@ export const useChecklist = ({
     completedItems,
     totalCount: localList.items.length,
     deletingItemsCount: itemsToDelete.length,
-    pendingTogglesCount: pendingToggles.size,
+    pendingTogglesCount,
     sensors,
-    DeleteModal: () => (
+    deleteModal: (
       <ConfirmModal
         isOpen={showDeleteModal}
         onClose={() => setShowDeleteModal(false)}

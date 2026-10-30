@@ -1,7 +1,8 @@
 import React, { useEffect, useState } from "react";
 import { cn } from "@/app/_utils/global-utils";
 import { getDeterministicColor } from "@/app/_utils/color-utils";
-import { getUserByUsername } from "@/app/_server/actions/users";
+import { initialsOf } from "@/app/_utils/avatar-utils";
+import { getPublicUser } from "@/app/_server/actions/users";
 
 interface UserAvatarProps {
   username: string;
@@ -35,26 +36,17 @@ export const UserAvatar: React.FC<UserAvatarProps> = ({
     lg: "h-10 w-10 text-lg",
   };
 
-  const words = username.split(" ").filter(Boolean);
-  let initials = "";
-
-  if (words.length === 1) {
-    initials = username.substring(0, 2).toUpperCase();
-  } else if (words.length > 1) {
-    initials = (words[0][0] + words[1][0]).toUpperCase();
-  }
+  const initials = initialsOf(username);
 
   const backgroundColor = getDeterministicColor(username);
 
   useEffect(() => {
-    console.log("avatarUrl", avatar);
-
     if (
       (avatarUrl === undefined || avatarUrl === null) &&
       cachedAvatar === undefined
     ) {
       const fetchAvatarUrl = async () => {
-        const user = await getUserByUsername(username);
+        const user = await getPublicUser(username);
         return user?.avatarUrl || "";
       };
 
@@ -89,9 +81,8 @@ export const UserAvatar: React.FC<UserAvatarProps> = ({
         />
       ) : (
         <span
-          className={`${sizeClasses[size]}${
-            size === "xs" ? " !text-[8px]" : ""
-          } flex items-center justify-center`}
+          className={`${sizeClasses[size]}${size === "xs" ? " !text-[8px]" : ""
+            } flex items-center justify-center`}
         >
           {initials}
         </span>

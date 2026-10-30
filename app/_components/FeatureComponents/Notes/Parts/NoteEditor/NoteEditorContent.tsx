@@ -1,17 +1,12 @@
-import {
-  TiptapEditor,
-  TiptapEditorRef,
-} from "@/app/_components/FeatureComponents/Notes/Parts/TipTap/TipTapEditor";
+import { TiptapEditor } from "@/app/_components/FeatureComponents/Notes/Parts/TipTap/TipTapEditor";
 import { UnifiedMarkdownRenderer } from "@/app/_components/FeatureComponents/Notes/Parts/UnifiedMarkdownRenderer";
-import { ReferencedBySection } from "@/app/_components/FeatureComponents/Notes/Parts/ReferencedBySection";
 import { ReadingProgressBar } from "@/app/_components/GlobalComponents/Layout/ReadingProgressBar";
 import { useAppMode } from "@/app/_providers/AppModeProvider";
-import { useSettings } from "@/app/_utils/settings-store";
-import { useSearchParams } from "next/navigation";
-import { useEffect, useRef, useMemo } from "react";
-import { getReferences } from "@/app/_utils/indexes-utils";
-import { usePermissions } from "@/app/_providers/PermissionsProvider";
-import { MinimalModeEditor } from "@/app/_components/FeatureComponents/Notes/Parts/TipTap/MinimalModeEditor";
+import { useQuickValue } from "@/app/_hooks/settings/useQuickSetting";
+import { QuickSettingId } from "@/app/_consts/quick-settings";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { MinimalEditorPanel } from "@/app/_components/FeatureComponents/Notes/Parts/TipTap/MinimalEditorPanel";
+import { useMinimalMode } from "@/app/_hooks/useMinimalMode";
 import { LockKeyIcon, ViewIcon, SquareUnlock01Icon } from "hugeicons-react";
 import { Button } from "@/app/_components/GlobalComponents/Buttons/Button";
 import {
@@ -19,9 +14,13 @@ import {
   isEncrypted,
 } from "@/app/_utils/encryption-utils";
 import { useTranslations } from "next-intl";
+import { useReadingAnchor } from "@/app/_hooks/useReadingAnchor";
+import { NOTE_PROSE_CLASS } from "@/app/_consts/notes";
+import { ItemTypes } from "@/app/_types/enums";
+import { cn } from "@/app/_utils/global-utils";
 
 interface NoteEditorContentProps {
-  isEditing: boolean;
+  isEditorVisible: boolean;
   noteContent?: string;
   editorContent: string;
   onEditorContentChange: (
@@ -29,74 +28,37 @@ interface NoteEditorContentProps {
     isMarkdown: boolean,
     isDirty: boolean,
   ) => void;
+  onRemoteContentChange?: (content: string, isMarkdown: boolean) => void;
   noteId?: string;
-  noteCategory?: string;
   encrypted?: boolean;
   onOpenDecryptModal?: () => void;
   onOpenViewModal?: () => void;
-  isEditingEncrypted?: boolean;
 }
 
 export const NoteEditorContent = ({
-  isEditing,
+  isEditorVisible,
   noteContent,
   editorContent,
   onEditorContentChange,
+  onRemoteContentChange,
   noteId,
-  noteCategory,
   encrypted,
   onOpenDecryptModal,
   onOpenViewModal,
-  isEditingEncrypted,
 }: NoteEditorContentProps) => {
   const t = useTranslations();
-  const { user, linkIndex, notes, checklists, appSettings } = useAppMode();
-  const { compactMode } = useSettings();
-  const searchParams = useSearchParams();
-  const notesDefaultMode = user?.notesDefaultMode || "view";
-  const editor = searchParams?.get("editor");
-  const editorRef = useRef<TiptapEditorRef>(null);
-  const { permissions } = usePermissions();
+  const { user } = useAppMode();
+  const compactMode = useQuickValue(QuickSettingId.COMPACT_MODE);
+  const isMinimalMode = useMinimalMode();
+  const rootRef = useRef<HTMLDivElement>(null);
 
-  const isMinimalMode = user?.disableRichEditor === "enable";
+  const [modeSwitches, setModeSwitches] = useState(0);
+  const holdAnchor = useReadingAnchor(rootRef, String(modeSwitches));
 
-  const referencingItems = useMemo(() => {
-    return getReferences(
-      linkIndex,
-      noteId,
-      noteCategory,
-      "note",
-      notes,
-      checklists,
-    );
-  }, [linkIndex, noteId, noteCategory, notes, checklists]);
-
-  useEffect(() => {
-    if (
-      editorRef.current &&
-      (isEditing || notesDefaultMode === "edit" || editor === "true") &&
-      !isMinimalMode
-    ) {
-      editorRef.current.updateAtMentionData(
-        notes,
-        checklists,
-        user?.username || "",
-      );
-    }
-  }, [
-    notes,
-    checklists,
-    isEditing,
-    notesDefaultMode,
-    editor,
-    editorRef,
-    isMinimalMode,
-  ]);
-
-  const isEditMode =
-    (notesDefaultMode === "edit" || editor === "true" || isEditing) &&
-    permissions?.canEdit &&
-    (!encrypted || isEditingEncrypted);
+  const handleModeChange = useCallback(() => {
+    holdAnchor();
+    setModeSwitches((count) => count + 1);
+  }, [holdAnchor]);
 
   const isContentEncrypted = isEncrypted(editorContent || "");
 
@@ -149,43 +111,42 @@ export const NoteEditorContent = ({
 
   if (isMinimalMode) {
     return (
-      <div className="flex-1 h-full pb-10 lg:pb-0">
-        <MinimalModeEditor
-          isEditing={isEditMode ?? false}
-          noteContent={encrypted ? editorContent : noteContent || ""}
-          onEditorContentChange={onEditorContentChange}
-          compactMode={compactMode}
-        />
-      </div>
+      <MinimalEditorPanel
+        isEditing={isEditorVisible}
+        noteContent={encrypted ? editorContent : noteContent || ""}
+        onEditorContentChange={onEditorContentChange}
+      />
     );
   }
 
   return (
-    <div className="flex-1 h-full">
-      {isEditMode ? (
+    <div
+      ref={rootRef}
+      className={cn("flex-1 min-h-full", isEditorVisible && "flex flex-col")}
+    >
+      {isEditorVisible ? (
         <TiptapEditor
-          ref={editorRef}
+          key={noteId}
+          collaborationUuid={!encrypted ? noteId : undefined}
+          attachTarget={noteId ? { uuid: noteId, type: ItemTypes.NOTE } : undefined}
           content={editorContent}
           onChange={onEditorContentChange}
+          onRemoteChange={onRemoteContentChange}
+          onModeChange={handleModeChange}
           tableSyntax={user?.tableSyntax}
-          notes={notes}
-          checklists={checklists}
         />
       ) : (
         <>
           <ReadingProgressBar />
           <div
-            className={`px-6 pt-6 pb-24 ${
+            className={`px-6 pt-6 pb-4 ${
               compactMode ? "max-w-[900px] mx-auto" : ""
             }`}
           >
             <UnifiedMarkdownRenderer
               content={encrypted ? editorContent : noteContent || ""}
+              className={NOTE_PROSE_CLASS}
             />
-            {referencingItems.length > 0 &&
-              appSettings?.editor?.enableBilateralLinks && (
-                <ReferencedBySection referencingItems={referencingItems} />
-              )}
           </div>
         </>
       )}

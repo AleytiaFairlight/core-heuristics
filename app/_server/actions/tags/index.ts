@@ -2,6 +2,7 @@
 
 import { join } from "path";
 import fs from "fs/promises";
+import { serverWriteFile } from "@/app/_server/actions/file";
 import { Result } from "@/app/_types";
 import { exportWholeDataFolder } from "../export";
 import { extractHashtagsFromContent } from "@/app/_utils/tag-utils";
@@ -9,6 +10,8 @@ import {
   extractYamlMetadata,
   updateYamlMetadata,
 } from "@/app/_utils/yaml-metadata-utils";
+import { Modes } from "@/app/_types/enums";
+import { canAccessAllContent } from "@/app/_server/actions/users";
 
 const findMarkdownFiles = async (dirPath: string): Promise<string[]> => {
   const markdownFiles: string[] = [];
@@ -39,7 +42,7 @@ const findMarkdownFiles = async (dirPath: string): Promise<string[]> => {
 
 const processDirectory = async (
   dirPath: string,
-  changes: string[]
+  changes: string[],
 ): Promise<{ processed: number; updated: number }> => {
   try {
     await fs.access(dirPath);
@@ -72,9 +75,9 @@ const processDirectory = async (
         const updatedContent = updateYamlMetadata(
           content,
           { tags: mergedTags },
-          true
+          true,
         );
-        await fs.writeFile(filePath, updatedContent, "utf-8");
+        await serverWriteFile(filePath, updatedContent);
         updated++;
       }
 
@@ -94,6 +97,13 @@ export const updateTagsFromContent = async (): Promise<
     changes: string[];
   }>
 > => {
+  if (!(await canAccessAllContent())) {
+    return {
+      success: false,
+      error: "Forbidden: Admin access with content permissions required",
+    };
+  }
+
   try {
     const changes: string[] = [];
 
@@ -107,8 +117,8 @@ export const updateTagsFromContent = async (): Promise<
     }
     changes.push("Data backup completed successfully");
 
-    const notesDir = join(process.cwd(), "data", "notes");
-    const checklistsDir = join(process.cwd(), "data", "checklists");
+    const notesDir = join(process.cwd(), "data", Modes.NOTES);
+    const checklistsDir = join(process.cwd(), "data", Modes.CHECKLISTS);
 
     const notesResult = await processDirectory(notesDir, changes);
     const checklistsResult = await processDirectory(checklistsDir, changes);

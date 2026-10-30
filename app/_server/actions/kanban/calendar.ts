@@ -1,0 +1,46 @@
+"use server";
+
+import { getFormData } from "@/app/_utils/global-utils";
+import { sessionActor } from "@/app/_server/actions/lib/actor";
+import { viewList } from "@/app/_server/actions/checklist/viewer";
+import {
+  generateICS,
+  parseItemsForCalendar,
+  CalendarEvent,
+} from "@/app/_utils/kanban/calendar-utils";
+
+export const exportBoardAsICS = async (formData: FormData) => {
+  try {
+    const { uuid } = getFormData(formData, ["uuid"]);
+
+    const actor = await sessionActor();
+    if ("error" in actor) return { error: actor.error };
+
+    const list = await viewList(uuid);
+    if (!list) return { error: "Board not found" };
+
+    const icsContent = generateICS(list.items, list.title);
+    return { success: true, data: icsContent };
+  } catch (error) {
+    console.error("Error exporting calendar:", error);
+    return { error: "Failed to export calendar" };
+  }
+};
+
+export const getCalendarEvents = async (formData: FormData) => {
+  try {
+    const { uuid } = getFormData(formData, ["uuid"]);
+
+    const actor = await sessionActor();
+    if ("error" in actor) return { error: actor.error };
+
+    const list = await viewList(uuid);
+    if (!list) return { error: "Board not found" };
+
+    const events: CalendarEvent[] = parseItemsForCalendar(list.items);
+    return { success: true, data: events };
+  } catch (error) {
+    console.error("Error fetching calendar events:", error);
+    return { error: "Failed to fetch calendar events" };
+  }
+};

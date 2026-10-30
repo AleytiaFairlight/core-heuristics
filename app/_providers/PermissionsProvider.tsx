@@ -4,7 +4,7 @@ import { createContext, useContext, useMemo } from "react";
 import { Checklist, Note } from "@/app/_types";
 import { getPermissions } from "@/app/_utils/sharing-utils";
 import { useAppMode } from "@/app/_providers/AppModeProvider";
-import { encodeCategoryPath } from "@/app/_utils/global-utils";
+import { Modes } from "../_types/enums";
 
 const permissionsCache = new Map<
   string,
@@ -18,6 +18,8 @@ interface PermissionsContextType {
     canEdit: boolean;
     canDelete: boolean;
     isOwner: boolean;
+    canFix: boolean;
+    isLocked: boolean;
   } | null;
 }
 
@@ -34,19 +36,18 @@ export const PermissionsProvider = ({
 }) => {
   const { globalSharing, user } = useAppMode();
 
-  const permissionsResult = useMemo(() => {
+  const basePermissions = useMemo(() => {
     const isAdmin = user?.isAdmin || false;
     const isOwner =
       (!item.isShared && user?.username && user.username === item.owner) ||
       false;
 
     if (item.isShared) {
-      const itemType = "items" in item ? "checklists" : "notes";
+      const itemType = "items" in item ? Modes.CHECKLISTS : Modes.NOTES;
       const permissions = getPermissions(
         globalSharing,
         user?.username || "",
-        item.uuid || item.id,
-        encodeCategoryPath(item.category || "Uncategorized"),
+        item.uuid!,
         itemType,
       );
       return {
@@ -66,9 +67,9 @@ export const PermissionsProvider = ({
       };
     }
 
-    const cacheKey = `${user?.username || ""}-${item.uuid || item.id}-${encodeCategoryPath(
-      item.category || "Uncategorized",
-    )}-${JSON.stringify(globalSharing || {})}`;
+    const cacheKey = `${user?.username || ""}-${item.uuid}-${JSON.stringify(
+      globalSharing || {},
+    )}`;
     const now = Date.now();
 
     const cached = permissionsCache.get(cacheKey);
@@ -76,12 +77,11 @@ export const PermissionsProvider = ({
       return cached.permissions;
     }
 
-    const itemType = "items" in item ? "checklists" : "notes";
+    const itemType = "items" in item ? Modes.CHECKLISTS : Modes.NOTES;
     const permissions = getPermissions(
       globalSharing,
       user?.username || "",
-      item.uuid || item.id,
-      encodeCategoryPath(item.category || "Uncategorized"),
+      item.uuid!,
       itemType,
     );
 
@@ -105,6 +105,16 @@ export const PermissionsProvider = ({
     item.owner,
     item.isShared,
   ]);
+
+  const permissionsResult = useMemo(() => {
+    const isLocked = Boolean(item.lockReason);
+    return {
+      ...basePermissions,
+      canEdit: basePermissions.canEdit && !isLocked,
+      canFix: basePermissions.canEdit && isLocked,
+      isLocked,
+    };
+  }, [basePermissions, item.lockReason]);
 
   return (
     <PermissionsContext.Provider value={{ permissions: permissionsResult }}>

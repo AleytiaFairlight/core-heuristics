@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { Checklist } from "@/app/_types";
-import { KanbanBoard } from "@/app/_components/FeatureComponents/Checklists/Parts/Kanban/KanbanBoard";
+import { Kanban } from "@/app/_components/FeatureComponents/Kanban/Kanban";
 import { useChecklist } from "@/app/_hooks/useChecklist";
 import { ChecklistHeader } from "@/app/_components/FeatureComponents/Checklists/Parts/Common/ChecklistHeader";
 import { ChecklistHeading } from "@/app/_components/FeatureComponents/Checklists/Parts/Common/ChecklistHeading";
@@ -68,6 +68,7 @@ export const ChecklistView = ({
     const result = await toggleArchive(localList, Modes.CHECKLISTS);
 
     if (result.success) {
+      onBack();
       router.refresh();
     }
   };
@@ -116,7 +117,7 @@ export const ChecklistView = ({
               ),
             },
           ]}
-          onRemove={() => {}}
+          onRemove={() => { }}
         ></ToastContainer>
       )}
 
@@ -136,7 +137,7 @@ export const ChecklistView = ({
               ),
             },
           ]}
-          onRemove={() => {}}
+          onRemove={() => { }}
         ></ToastContainer>
       )}
 
@@ -165,7 +166,7 @@ export const ChecklistView = ({
         />
       ) : (
         <div className="flex-1 overflow-hidden p-4">
-          <KanbanBoard checklist={localList} onUpdate={onUpdate} />
+          <Kanban checklist={localList} onUpdate={onUpdate} />
         </div>
       )}
 

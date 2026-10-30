@@ -11,14 +11,19 @@ import {
 } from "react";
 import { useRouter } from "next/navigation";
 import { useEditorActivityStore } from "@/app/_utils/editor-activity-store";
+import { useAppMode } from "@/app/_providers/AppModeProvider";
 import type { WsEvent } from "@/app/_types";
 
 interface WebSocketContextType {
   isConnected: boolean;
+  subscribe: (handler: (event: WsEvent) => void) => () => void;
 }
+
+const _noop = () => () => {};
 
 const WebSocketContext = createContext<WebSocketContextType>({
   isConnected: false,
+  subscribe: _noop,
 });
 
 export const useWebSocket = () => useContext(WebSocketContext);
@@ -29,6 +34,7 @@ const REFRESH_DEBOUNCE = 500;
 
 export const WebSocketProvider = ({ children }: { children: ReactNode }) => {
   const router = useRouter();
+  const { user } = useAppMode();
   const [isConnected, setIsConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const connectionIdRef = useRef<string | null>(null);
@@ -37,8 +43,14 @@ export const WebSocketProvider = ({ children }: { children: ReactNode }) => {
   const hasPendingUpdates = useRef(false);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
+  const listenersRef = useRef<Set<(event: WsEvent) => void>>(new Set());
 
   const isEditorActive = useEditorActivityStore((s) => s.isActive);
+
+  const subscribe = useCallback((handler: (event: WsEvent) => void) => {
+    listenersRef.current.add(handler);
+    return () => { listenersRef.current.delete(handler); };
+  }, []);
 
   const debouncedRefresh = useCallback(() => {
     if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
@@ -50,12 +62,17 @@ export const WebSocketProvider = ({ children }: { children: ReactNode }) => {
   const handleMessage = useCallback(
     (event: MessageEvent) => {
       try {
-        const data = JSON.parse(event.data);
+        const raw = JSON.parse(event.data) as Record<string, unknown>;
 
-        if (data.type === "connected") {
-          connectionIdRef.current = data.connectionId;
+        if (raw.type === "connected") {
+          connectionIdRef.current = (raw.connectionId as string) ?? null;
           return;
         }
+
+        const data = raw as unknown as WsEvent;
+        listenersRef.current.forEach((handler) => handler(data));
+
+        if (data.type === "notification") return;
 
         if (isEditorActive()) {
           hasPendingUpdates.current = true;
@@ -70,6 +87,7 @@ export const WebSocketProvider = ({ children }: { children: ReactNode }) => {
 
   const connect = useCallback(() => {
     if (!mountedRef.current) return;
+    if (!user) return;
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
     const isDev = process.env.NODE_ENV === "development";
@@ -111,7 +129,7 @@ export const WebSocketProvider = ({ children }: { children: ReactNode }) => {
     };
 
     wsRef.current = ws;
-  }, [handleMessage]);
+  }, [handleMessage, user]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -133,7 +151,7 @@ export const WebSocketProvider = ({ children }: { children: ReactNode }) => {
   }, [isEditorActive, debouncedRefresh]);
 
   return (
-    <WebSocketContext.Provider value={{ isConnected }}>
+    <WebSocketContext.Provider value={{ isConnected, subscribe }}>
       {children}
     </WebSocketContext.Provider>
   );

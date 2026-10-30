@@ -9,30 +9,16 @@ export {
 } from "./crud";
 
 export {
-  getUserByUsername,
+  getPublicUser,
   getCurrentUser,
   hasUsers,
   getUsername,
   getUsers,
+  getUsersForAdmin,
   getUserByNoteUuid,
   getUserByChecklistUuid,
-  getUserByChecklist,
-  getUserByNote,
 } from "./queries";
 
-export {
-  isAuthenticated,
-  isAdmin,
-  canAccessAllContent,
-} from "./auth";
+export { isAuthenticated, isAdmin, canAccessAllContent } from "./auth";
 
-export {
-  updateUserSettings,
-} from "./settings";
-
-export {
-  getUserIndex,
-  findFileRecursively,
-  getUserByItem,
-  getUserByItemUuid,
-} from "./helpers";
+export { updateUserSettings } from "./settings";

@@ -1,7 +1,7 @@
 import path from "path";
-import { Item } from "@/app/_types";
+import { Item, KanbanPriority, KanbanReminder } from "@/app/_types";
 import { Checklist, ChecklistType } from "@/app/_types";
-import { ChecklistsTypes, TaskStatus } from "@/app/_types/enums";
+import { ChecklistsTypes, isKanbanType, TaskStatus } from "@/app/_types/enums";
 import {
   parseRecurrenceFromMarkdown,
   recurrenceToMarkdown,
@@ -12,15 +12,15 @@ import {
   extractChecklistType,
   generateYamlFrontmatter,
   generateUuid,
+  strayMeta,
+  createdAtOf,
+  OwnedMetaKeys,
+  BoardMetaKeys,
+  LIST_META_KEYS,
 } from "./yaml-metadata-utils";
 import { extractHashtagsFromContent, normalizeTag } from "./tag-utils";
-
-export const isItemCompleted = (item: Item, checklistType: string): boolean => {
-  if (checklistType === ChecklistsTypes.TASK) {
-    return item.status === TaskStatus.COMPLETED || !!item.completed;
-  }
-  return !!item.completed;
-};
+import { SHARED_WITH_KEY } from "@/app/_consts/sharing";
+import { AGENT_SEGMENT } from "@/app/_consts/agents";
 
 export const areAllItemsCompleted = (items: any[]): boolean => {
   if (items.length === 0) return true;
@@ -39,35 +39,8 @@ export const formatTime = (seconds: number): string => {
   return `${minutes}m`;
 };
 
-export const countItems = (
-  items: Item[],
-  checklistType?: string
-): { total: number; completed: number } =>
-  items.reduce((acc, item) => {
-    if (item.isArchived) return acc;
-
-    if (item.children && item.children.length > 0) {
-      const childCounts = countItems(item.children, checklistType);
-      return {
-        total: acc.total + childCounts.total,
-        completed: acc.completed + childCounts.completed,
-      };
-    }
-
-    return {
-      total: acc.total + 1,
-      completed: isItemCompleted(item, checklistType || "") ? acc.completed + 1 : acc.completed,
-    };
-  }, { total: 0, completed: 0 });
-
-export const getCompletionRate = (
-  items: Item[],
-  checklistType?: string
-): number => {
-  const { total, completed } = countItems(items, checklistType);
-  if (total === 0) return 0;
-  return Math.round((completed / total) * 100);
-};
+const _flatDescription = (text: string): string =>
+  text.replace(/\r?\n/g, "\\n").replace(/\|/g, "∣");
 
 export const parseMarkdown = (
   content: string,
@@ -76,23 +49,23 @@ export const parseMarkdown = (
   owner?: string,
   isShared?: boolean,
   fileStats?: { birthtime: Date; mtime: Date },
-  fileName?: string
+  fileName?: string,
 ): Checklist => {
   const { metadata, contentWithoutMetadata } = extractYamlMetadata(content);
 
-  let title = extractTitle(
+  const title = extractTitle(
     content,
-    fileName ? path.basename(fileName, ".md") : undefined
+    fileName ? path.basename(fileName, ".md") : undefined,
   );
 
   const type = extractChecklistType(content);
 
   const checklistType =
-    type === "task" ? ChecklistsTypes.TASK : ChecklistsTypes.SIMPLE;
+    type === "kanban" ? ChecklistsTypes.KANBAN : ChecklistsTypes.SIMPLE;
 
   const lines = contentWithoutMetadata.split("\n");
   const itemLines = lines.filter(
-    (line) => line.trim().startsWith("- [") || /^\s*- \[/.test(line)
+    (line) => line.trim().startsWith("- [") || /^\s*- \[/.test(line),
   );
 
   let globalItemCounter = 0;
@@ -104,7 +77,7 @@ export const parseMarkdown = (
     lines: string[],
     startIndex: number = 0,
     parentLevel: number = 0,
-    itemIndex: number = 0
+    itemIndex: number = 0,
   ): { items: Item[]; nextIndex: number } => {
     const items: Item[] = [];
     let currentIndex = startIndex;
@@ -158,7 +131,7 @@ export const parseMarkdown = (
         let item: Item;
         let recurrence = undefined;
 
-        if (type === "task" && text.includes(" | ")) {
+        if (type === "kanban" && text.includes(" | ")) {
           const parts = text.split(" | ");
           const itemText = parts[0].replace(/∣/g, "|");
           const metadata = parts.slice(1);
@@ -167,8 +140,14 @@ export const parseMarkdown = (
           let timeEntries: any[] = [];
           let estimatedTime: number | undefined;
           let targetDate: string | undefined;
+          let startDate: string | undefined;
           let description: string | undefined;
           let itemMetadata: Record<string, any> = {};
+          let priority: KanbanPriority | undefined;
+          let score: number | undefined;
+          let assignee: string | undefined;
+          let agent: string | undefined;
+          let reminder: KanbanReminder | undefined;
 
           metadata.forEach((meta) => {
             if (meta.startsWith("status:")) {
@@ -186,6 +165,8 @@ export const parseMarkdown = (
               estimatedTime = parseInt(meta.substring(10));
             } else if (meta.startsWith("target:")) {
               targetDate = meta.substring(7);
+            } else if (meta.startsWith("start:")) {
+              startDate = meta.substring(6);
             } else if (meta.startsWith("description:")) {
               description = meta.substring(12).replace(/∣/g, "|");
             } else if (meta.startsWith("metadata:")) {
@@ -196,6 +177,20 @@ export const parseMarkdown = (
               }
             } else if (meta.startsWith("recurrence:")) {
               recurrence = parseRecurrenceFromMarkdown([meta]);
+            } else if (meta.startsWith("priority:")) {
+              priority = meta.substring(9) as KanbanPriority;
+            } else if (meta.startsWith("score:")) {
+              score = parseInt(meta.substring(6));
+            } else if (meta.startsWith("assignee:")) {
+              assignee = meta.substring(9);
+            } else if (meta.startsWith(AGENT_SEGMENT)) {
+              agent = meta.substring(AGENT_SEGMENT.length).trim() || undefined;
+            } else if (meta.startsWith("reminder:")) {
+              try {
+                reminder = JSON.parse(meta.substring(9));
+              } catch {
+                reminder = { datetime: meta.substring(9) };
+              }
             }
           });
 
@@ -207,10 +202,16 @@ export const parseMarkdown = (
             status,
             timeEntries,
             estimatedTime,
+            startDate,
             targetDate,
             description,
             ...itemMetadata,
             ...(recurrence ? { recurrence } : {}),
+            ...(priority ? { priority } : {}),
+            ...(score !== undefined ? { score } : {}),
+            ...(assignee ? { assignee } : {}),
+            ...(agent ? { agent } : {}),
+            ...(reminder ? { reminder } : {}),
           };
         } else {
           let itemText = text.replace(/∣/g, "|");
@@ -253,7 +254,7 @@ export const parseMarkdown = (
           lines,
           currentIndex + 1,
           parentLevel + 1,
-          0
+          0,
         );
         if (nestedResult.items.length > 0) {
           item.children = nestedResult.items;
@@ -311,9 +312,7 @@ export const parseMarkdown = (
     type: checklistType,
     category,
     items,
-    createdAt: fileStats
-      ? fileStats.birthtime.toISOString()
-      : new Date().toISOString(),
+    createdAt: createdAtOf(metadata, fileStats?.birthtime ?? new Date()),
     updatedAt: fileStats
       ? fileStats.mtime.toISOString()
       : new Date().toISOString(),
@@ -321,19 +320,29 @@ export const parseMarkdown = (
     isShared,
     ...(statuses && { statuses }),
     ...(tags.length > 0 && { tags }),
+    ...(typeof metadata[BoardMetaKeys.SPEC_NOTE] === "string" && {
+      specNote: metadata[BoardMetaKeys.SPEC_NOTE] as string,
+    }),
+    ...(metadata[SHARED_WITH_KEY] !== undefined && {
+      sharedWith: metadata[SHARED_WITH_KEY] as string | string[],
+    }),
+    extraMetadata: strayMeta(metadata, LIST_META_KEYS),
   };
 };
+
+const pipeSafeJson = (value: unknown) =>
+  JSON.stringify(value).replace(/\|/g, "\\u007c");
 
 const generateItemMarkdown = (
   item: Item,
   type: ChecklistType,
-  indentLevel: number = 0
+  indentLevel: number = 0,
 ): string => {
   const indent = "  ".repeat(indentLevel);
   const escapedText = item.text.replace(/\|/g, "∣");
 
   let itemLine: string;
-  if (type === "task") {
+  if (isKanbanType(type)) {
     const metadata: string[] = [];
 
     if (item.status && item.status !== TaskStatus.TODO) {
@@ -361,11 +370,14 @@ const generateItemMarkdown = (
       itemMetadata.archivedBy = item.archivedBy;
       itemMetadata.previousStatus = item.previousStatus;
     }
+    if (item.externalId) {
+      itemMetadata.externalId = item.externalId;
+    }
 
     const timeEntries = item.timeEntries;
 
     if (timeEntries && timeEntries.length > 0) {
-      metadata.push(`time:${JSON.stringify(timeEntries)}`);
+      metadata.push(`time:${pipeSafeJson(timeEntries)}`);
     } else {
       metadata.push("time:0");
     }
@@ -374,12 +386,16 @@ const generateItemMarkdown = (
       metadata.push(`estimated:${item.estimatedTime}`);
     }
 
+    if (item.startDate) {
+      metadata.push(`start:${item.startDate}`);
+    }
+
     if (item.targetDate) {
       metadata.push(`target:${item.targetDate}`);
     }
 
     if (item.description) {
-      metadata.push(`description:${item.description.replace(/\|/g, "∣")}`);
+      metadata.push(`description:${_flatDescription(item.description)}`);
     }
 
     if (item.recurrence) {
@@ -387,8 +403,28 @@ const generateItemMarkdown = (
       metadata.push(...recurrenceParts);
     }
 
+    if (item.priority && item.priority !== "none") {
+      metadata.push(`priority:${item.priority}`);
+    }
+
+    if (item.score !== undefined) {
+      metadata.push(`score:${item.score}`);
+    }
+
+    if (item.assignee) {
+      metadata.push(`assignee:${item.assignee}`);
+    }
+
+    if (item.agent) {
+      metadata.push(`${AGENT_SEGMENT}${item.agent}`);
+    }
+
+    if (item.reminder) {
+      metadata.push(`reminder:${pipeSafeJson(item.reminder)}`);
+    }
+
     if (Object.keys(itemMetadata).length > 0) {
-      metadata.push(`metadata:${JSON.stringify(itemMetadata)}`);
+      metadata.push(`metadata:${pipeSafeJson(itemMetadata)}`);
     }
 
     itemLine = `${indent}- [${item.completed ? "x" : " "
@@ -424,18 +460,36 @@ const generateItemMarkdown = (
     if (item.estimatedTime) {
       itemMetadata.estimatedTime = item.estimatedTime;
     }
+    if (item.startDate) {
+      itemMetadata.startDate = item.startDate;
+    }
     if (item.targetDate) {
       itemMetadata.targetDate = item.targetDate;
+    }
+    if (item.priority && item.priority !== "none") {
+      itemMetadata.priority = item.priority;
+    }
+    if (item.score !== undefined) {
+      itemMetadata.score = item.score;
+    }
+    if (item.assignee) {
+      itemMetadata.assignee = item.assignee;
+    }
+    if (item.agent) {
+      itemMetadata.agent = item.agent;
+    }
+    if (item.reminder) {
+      itemMetadata.reminder = item.reminder;
     }
 
     const metadata: string[] = [];
 
     if (item.description) {
-      metadata.push(`description:${item.description.replace(/\|/g, "∣")}`);
+      metadata.push(`description:${_flatDescription(item.description)}`);
     }
 
     if (Object.keys(itemMetadata).length > 0) {
-      metadata.push(`metadata:${JSON.stringify(itemMetadata)}`);
+      metadata.push(`metadata:${pipeSafeJson(itemMetadata)}`);
     }
 
     if (item.recurrence) {
@@ -459,10 +513,15 @@ const generateItemMarkdown = (
 };
 
 export const listToMarkdown = (list: Checklist): string => {
-  const metadata: any = {};
+  const metadata: Record<string, unknown> = {
+    ...(list.createdAt && { [OwnedMetaKeys.CREATED_AT]: list.createdAt }),
+    ...(list.extraMetadata || {}),
+  };
   metadata.uuid = list.uuid || generateUuid();
   metadata.title = list.title || "Untitled Checklist";
-  if (list.type === ChecklistsTypes.TASK) metadata.checklistType = "task";
+  if (list.type === ChecklistsTypes.KANBAN) metadata.checklistType = "kanban";
+  else if (list.type === ChecklistsTypes.TASK)
+    metadata.checklistType = "kanban";
   else if (list.type === ChecklistsTypes.SIMPLE)
     metadata.checklistType = "simple";
 
@@ -472,6 +531,14 @@ export const listToMarkdown = (list: Checklist): string => {
 
   if (list.tags && list.tags.length > 0) {
     metadata.tags = list.tags;
+  }
+
+  if (list.sharedWith !== undefined) {
+    metadata[SHARED_WITH_KEY] = list.sharedWith;
+  }
+
+  if (list.specNote) {
+    metadata[BoardMetaKeys.SPEC_NOTE] = list.specNote;
   }
 
   const frontmatter = generateYamlFrontmatter(metadata);

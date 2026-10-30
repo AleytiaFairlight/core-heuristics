@@ -4,45 +4,60 @@ import {
   Item,
   ChecklistType,
   KanbanStatus,
+  KanbanPriority,
+  KanbanReminder,
 } from "@/app/_types";
 
-import { TaskStatus } from "@/app/_types/enums";
+import { ChecklistsTypes, isKanbanType, TaskStatus } from "@/app/_types/enums";
 import { parseRecurrenceFromMarkdown } from "@/app/_utils/recurrence-utils";
-import { extractYamlMetadata } from "./yaml-metadata-utils";
+import { SHARED_WITH_KEY } from "@/app/_consts/sharing";
+import { AGENT_SEGMENT } from "@/app/_consts/agents";
+import {
+  BoardMetaKeys,
+  extractYamlMetadata,
+  LIST_META_KEYS,
+  strayMeta,
+} from "./yaml-metadata-utils";
+import { titleOf } from "./title-utils";
 
 export const parseChecklistContent = (
   rawContent: string,
-  id: string
+  id: string,
 ): {
   title: string;
   items: Item[];
   uuid?: string;
   type?: ChecklistType;
   statuses?: KanbanStatus[];
+  tags?: string[];
+  sharedWith?: string | string[];
+  specNote?: string;
+  extraMetadata?: Record<string, unknown>;
 } => {
   const { metadata, contentWithoutMetadata } = extractYamlMetadata(rawContent);
 
-  let title: string;
-  if (metadata.title) {
-    title = metadata.title;
-  } else {
-    title = id.replace(/-/g, " ");
-  }
+  const title = titleOf(metadata, contentWithoutMetadata, id);
 
   const checklistType =
     metadata?.checklistType ||
-    (rawContent.includes("<!-- type:task -->") ? "task" : "simple");
+    (rawContent.includes("<!-- type:task -->")
+      ? ChecklistsTypes.TASK
+      : ChecklistsTypes.SIMPLE);
 
   const lines = contentWithoutMetadata.split("\n");
   const itemLines = lines.filter(
-    (line) => line.trim().startsWith("- [") || /^\s*- \[/.test(line)
+    (line) => line.trim().startsWith("- [") || /^\s*- \[/.test(line),
   );
+
+  let globalItemCounter = 0;
+  const generateItemId = (level: number): string =>
+    `${id}-${level}-${globalItemCounter++}`;
 
   const buildNestedItems = (
     lines: string[],
     startIndex: number = 0,
     parentLevel: number = 0,
-    itemIndex: number = 0
+    itemIndex: number = 0,
   ): { items: Item[]; nextIndex: number } => {
     const items: Item[] = [];
     let currentIndex = startIndex;
@@ -96,7 +111,7 @@ export const parseChecklistContent = (
         let item: Item;
         let recurrence = undefined;
 
-        const isTask = checklistType === "task";
+        const isTask = isKanbanType(checklistType);
 
         if (isTask && text.includes(" | ")) {
           const parts = text.split(" | ");
@@ -107,8 +122,14 @@ export const parseChecklistContent = (
           let timeEntries: any[] = [];
           let estimatedTime: number | undefined;
           let targetDate: string | undefined;
+          let startDate: string | undefined;
           let description: string | undefined;
-          let itemMetadata: Record<string, any> = {};
+          let itemMetadata: Record<string, unknown> = {};
+          let priority: KanbanPriority | undefined;
+          let score: number | undefined;
+          let assignee: string | undefined;
+          let agent: string | undefined;
+          let reminder: KanbanReminder | undefined;
 
           metadataParts.forEach((meta) => {
             if (meta.startsWith("status:")) {
@@ -126,31 +147,57 @@ export const parseChecklistContent = (
               estimatedTime = parseInt(meta.substring(10));
             } else if (meta.startsWith("target:")) {
               targetDate = meta.substring(7);
+            } else if (meta.startsWith("start:")) {
+              startDate = meta.substring(6);
             } else if (meta.startsWith("description:")) {
               description = meta.substring(12).replace(/∣/g, "|");
             } else if (meta.startsWith("metadata:")) {
               try {
-                itemMetadata = JSON.parse(meta.substring(9));
+                itemMetadata = JSON.parse(meta.substring(9)) as Record<
+                  string,
+                  unknown
+                >;
               } catch (e) {
                 console.warn("Failed to parse item metadata:", e);
               }
             } else if (meta.startsWith("recurrence:")) {
               recurrence = parseRecurrenceFromMarkdown([meta]);
+            } else if (meta.startsWith("priority:")) {
+              priority = meta.substring(9) as KanbanPriority;
+            } else if (meta.startsWith("score:")) {
+              const parsed = parseInt(meta.substring(6), 10);
+              if (!Number.isNaN(parsed)) score = parsed;
+            } else if (meta.startsWith("assignee:")) {
+              assignee = meta.substring(9) || undefined;
+            } else if (meta.startsWith(AGENT_SEGMENT)) {
+              agent = meta.substring(AGENT_SEGMENT.length).trim() || undefined;
+            } else if (meta.startsWith("reminder:")) {
+              try {
+                reminder = JSON.parse(meta.substring(9)) as KanbanReminder;
+              } catch {
+                reminder = { datetime: meta.substring(9) };
+              }
             }
           });
 
           item = {
-            id: itemMetadata.id || `${id}-${currentItemIndex}`,
+            id: (itemMetadata.id as string) || generateItemId(parentLevel),
             text: itemText,
             completed,
             order: currentItemIndex,
             status,
             timeEntries,
             estimatedTime,
+            startDate,
             targetDate,
             description,
             ...itemMetadata,
             ...(recurrence ? { recurrence } : {}),
+            ...(priority ? { priority } : {}),
+            ...(score !== undefined ? { score } : {}),
+            ...(assignee ? { assignee } : {}),
+            ...(agent ? { agent } : {}),
+            ...(reminder ? { reminder } : {}),
           };
         } else {
           let itemText = text.replace(/∣/g, "|");
@@ -178,7 +225,7 @@ export const parseChecklistContent = (
           }
 
           item = {
-            id: itemMetadata.id || `${id}-${currentItemIndex}`,
+            id: itemMetadata.id || generateItemId(parentLevel),
             text: itemText,
             completed,
             order: currentItemIndex,
@@ -193,7 +240,7 @@ export const parseChecklistContent = (
           lines,
           currentIndex + 1,
           parentLevel + 1,
-          0
+          0,
         );
         if (nestedResult.items.length > 0) {
           (item as any).children = nestedResult.items;
@@ -218,10 +265,29 @@ export const parseChecklistContent = (
 
   const { items } = buildNestedItems(itemLines, 0, 0, 0);
 
+  const dedupeItemIds = (itemList: Item[], seen: Set<string>): void => {
+    itemList.forEach((item) => {
+      if (item.id && seen.has(item.id)) {
+        item.id = generateItemId(0);
+      }
+      if (item.id) {
+        seen.add(item.id);
+      }
+      if (item.children && item.children.length > 0) {
+        dedupeItemIds(item.children, seen);
+      }
+    });
+  };
+  dedupeItemIds(items, new Set<string>());
+
   let statuses = undefined;
   if (metadata.statuses && Array.isArray(metadata.statuses)) {
     statuses = metadata.statuses;
   }
+
+  const tags = Array.isArray(metadata.tags)
+    ? (metadata.tags as string[])
+    : undefined;
 
   return {
     title,
@@ -229,36 +295,44 @@ export const parseChecklistContent = (
     uuid: metadata.uuid,
     type: checklistType,
     ...(statuses && { statuses }),
+    ...(tags && { tags }),
+    ...(metadata[SHARED_WITH_KEY] !== undefined && {
+      sharedWith: metadata[SHARED_WITH_KEY] as string | string[],
+    }),
+    ...(typeof metadata[BoardMetaKeys.SPEC_NOTE] === "string" && {
+      specNote: metadata[BoardMetaKeys.SPEC_NOTE] as string,
+    }),
+    extraMetadata: strayMeta(metadata, LIST_META_KEYS),
   };
 };
 
 export const parseNoteContent = (
   rawContent: string,
-  id: string
-): { title: string; content: string; uuid?: string; encrypted?: boolean; encryptionMethod?: "pgp" | "xchacha"; tags?: string[] } => {
+  id: string,
+): {
+  title: string;
+  content: string;
+  uuid?: string;
+  encrypted?: boolean;
+  encryptionMethod?: "pgp" | "xchacha";
+  tags?: string[];
+  sharedWith?: string | string[];
+  extraMetadata?: Record<string, unknown>;
+} => {
   const { metadata, contentWithoutMetadata } = extractYamlMetadata(rawContent);
 
   const tags = Array.isArray(metadata.tags) ? metadata.tags : undefined;
 
-  if (metadata.title) {
-    return {
-      title: metadata.title,
-      content: contentWithoutMetadata,
-      uuid: metadata.uuid,
-      encrypted: metadata.encrypted || false,
-      encryptionMethod: metadata.encryptionMethod,
-      tags,
-    };
-  }
-
-  const title = id.replace(/-/g, " ");
-
   return {
-    title,
+    title: titleOf(metadata, contentWithoutMetadata, id),
     content: contentWithoutMetadata,
     uuid: metadata.uuid,
     encrypted: metadata.encrypted || false,
     encryptionMethod: metadata.encryptionMethod,
     tags,
+    ...(metadata[SHARED_WITH_KEY] !== undefined && {
+      sharedWith: metadata[SHARED_WITH_KEY] as string | string[],
+    }),
+    extraMetadata: strayMeta(metadata),
   };
 };
